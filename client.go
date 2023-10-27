@@ -28,8 +28,13 @@ type ProductionConf struct {
 	//生产分区生成
 	Partitioner string
 	// writer
-	writer   *kafka.Writer
-	Balancer kafka.Balancer //消息分发(partition)策略
+
+	writer *kafka.Writer
+	//消息分发(partition)策略
+	//
+	// &kafka.Hash{}, -> 算法: hasher.Sum32() % len(partitions)
+	// &kafka.Hash{}, -> 算法: (int32(hasher.Sum32()) & 0x7fffffff) % len(partitions) => partition
+	Balancer kafka.Balancer
 	/*
 
 		综上可知，出现发送 1 条消息耗时 1 秒的情况的原因是：在同步地发送 1 条消息后，

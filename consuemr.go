@@ -45,6 +45,7 @@ func (c *Consumer) Connect() error {
 
 	return nil
 }
+
 func (c *Consumer) CreateReader() error {
 	kr := kafka.ReaderConfig{
 		Brokers: []string{c.Address},

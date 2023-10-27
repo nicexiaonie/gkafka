@@ -4,6 +4,7 @@ import (
 	"github.com/segmentio/kafka-go"
 	"gkafka"
 	"log"
+	"sync"
 	"time"
 )
 
@@ -21,12 +22,40 @@ func main() {
 			return nil
 		},
 	})
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		consumer := gkafka.GetConsumer("demo")
+		err := consumer.RunCommit()
+		if err != nil {
+			log.Println("RunCommit error: ", err)
+			return
+		}
+	}()
+	go c2()
 
-	consumer := gkafka.GetConsumer("demo")
+	wg.Wait()
+
+}
+func c2() {
+
+	_ = gkafka.RegisterConsumer("demo2", &gkafka.ConsumerConf{
+		NetWork:          "tcp",
+		Address:          "192.168.0.46:9092",
+		Topic:            "test",
+		GroupId:          "game_room_server",
+		MaxWait:          1 * time.Second,
+		ReadBatchTimeout: 1 * time.Second,
+		CallFunc: func(m kafka.Message) error {
+			log.Printf("message at topic:%s, partition:%d, offset:%d, key:%s, value:%s \n", m.Topic, m.Partition, m.Offset, string(m.Key), string(m.Value))
+			return nil
+		},
+	})
+
+	consumer := gkafka.GetConsumer("demo2")
 	err := consumer.RunCommit()
 	if err != nil {
 		log.Println("RunCommit error: ", err)
 		return
 	}
-
 }

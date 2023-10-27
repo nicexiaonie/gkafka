@@ -47,7 +47,10 @@ func (p *Production) Connect() {
 		BatchSize:    p.BatchSize,
 		BatchTimeout: p.BatchTimeout,
 		WriteTimeout: p.WriteTimeout,
-		RequiredAcks: p.RequiredAcks,
+	}
+	// 支持写入分区平衡器
+	if p.Balancer != nil {
+		p.writer.Balancer = p.Balancer
 	}
 	log.Println("Connect: ", p)
 
@@ -67,6 +70,23 @@ func (p *Production) Send(key, value string) error {
 	}
 	return nil
 }
+
+func (p *Production) SendPartition(part int, key, value string) error {
+	if len(p.Topic) <= 0 {
+		return errors.New("topic not is nil")
+	}
+	err := p.sendMessage(kafka.Message{
+		Topic:     p.Topic,
+		Partition: part,
+		Key:       []byte(key),
+		Value:     []byte(value),
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func (p *Production) SendTopic(topic, key, value string) error {
 	err := p.sendMessage(kafka.Message{
 		Topic: topic,
@@ -80,7 +100,6 @@ func (p *Production) SendTopic(topic, key, value string) error {
 }
 
 func (p *Production) sendMessage(message kafka.Message) error {
-	message.Topic = p.Topic
 	err := p.writer.WriteMessages(p.Ctx, message)
 	if err != nil {
 		log.Println("err: ", err)
@@ -88,6 +107,7 @@ func (p *Production) sendMessage(message kafka.Message) error {
 	}
 	return nil
 }
+
 func (p *Production) sendMessageBatch(message ...kafka.Message) error {
 	err := p.writer.WriteMessages(p.Ctx, message...)
 	if err != nil {
