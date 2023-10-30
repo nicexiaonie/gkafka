@@ -53,6 +53,8 @@ func c2() {
 	})
 
 	consumer := gkafka.GetConsumer("demo2")
+
+	// 当启用RunCommit方法消费时，根据返回error进行自动commit offset
 	err := consumer.RunCommit()
 	if err != nil {
 		log.Println("RunCommit error: ", err)

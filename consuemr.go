@@ -96,3 +96,17 @@ func (c *Consumer) RunCommit() error {
 	}
 	return nil
 }
+
+func (c *Consumer) Close() error {
+	err := c.Reader.Close()
+	if err != nil {
+		return err
+	}
+
+	err = c.conn.Close()
+	if err != nil {
+		return err
+	}
+	return nil
+
+}

@@ -115,3 +115,20 @@ func (p *Production) sendMessageBatch(message ...kafka.Message) error {
 	}
 	return nil
 }
+
+func (p *Production) Close(message ...kafka.Message) error {
+	if p.writer != nil {
+		err := p.writer.Close()
+		if err != nil {
+			return err
+		}
+	}
+	if p.conn != nil {
+		err := p.conn.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+
+}
