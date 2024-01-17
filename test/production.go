@@ -1,8 +1,8 @@
 package main
 
 import (
+	"github.com/nicexiaonie/gkafka"
 	"github.com/segmentio/kafka-go"
-	"gkafka"
 )
 
 func main() {

@@ -2,8 +2,8 @@ package main
 
 import (
 	"fmt"
+	"github.com/nicexiaonie/gkafka"
 	"github.com/segmentio/kafka-go"
-	"gkafka"
 	"log"
 	"sync"
 	"time"
