@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"github.com/segmentio/kafka-go"
 	"gkafka"
 )
@@ -8,9 +9,9 @@ import (
 func main() {
 	gkafka.RegisterProduction("demo", &gkafka.ProductionConf{
 		NetWork: "tcp",
-		Address: "192.168.0.46:9092",
+		Address: "10.20.0.200:9092",
 		// 如果不配置topic
-		Topic:     "old_hy_club_card_rec_fuxin",
+		Topic:     "data_sync_canal_to_clickhouse",
 		BatchSize: 1,
 		//消息分发(partition)策略
 		//
@@ -22,14 +23,22 @@ func main() {
 	})
 
 	production := gkafka.GetProduction("demo")
+	t1 := kafka.TopicConfig{
+		Topic:             "data_sync_canal_to_clickhouse_test",
+		NumPartitions:     1,
+		ReplicationFactor: 1,
+	}
+
+	err := production.GetConn().CreateTopics(t1)
+	fmt.Println(err)
 
 	// 默认发送配置的topic
-	production.Send("1111", "11111")
+	//production.Send("1111", "11111")
 
 	// 发送默认topic 指定分区
-	production.SendPartition(2, "1111", "11111")
+	//production.SendPartition(2, "1111", "11111")
 
 	// 可以指定topic发送
-	production.SendTopic("test", "test", "test")
+	//production.SendTopic("data_sync_canal_to_clickhouse_1", "test", "test")
 
 }

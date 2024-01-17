@@ -38,7 +38,7 @@ type Production struct {
 	RequiredAcks kafka.RequiredAcks
 }
 
-func (p *Production) Connect() {
+func (p *Production) Connect() error {
 	if len(p.NetWork) <= 0 {
 		p.NetWork = "tcp"
 	}
@@ -52,8 +52,18 @@ func (p *Production) Connect() {
 	if p.Balancer != nil {
 		p.writer.Balancer = p.Balancer
 	}
-	log.Println("Connect: ", p)
 
+	conn, err := kafka.Dial(p.NetWork, p.Address)
+	if err != nil {
+		return err
+	}
+	p.conn = conn
+	log.Println("Connect: ", p)
+	return nil
+}
+
+func (p *Production) GetConn() *kafka.Conn {
+	return p.conn
 }
 
 func (p *Production) Send(key, value string) error {
