@@ -56,7 +56,7 @@ func (c *Consumer) CreateReader() error {
 	}
 	if len(c.GroupId) > 0 {
 		log.Println(c.GroupId)
-		//kr.GroupID = c.GroupId
+		kr.GroupID = c.GroupId
 	}
 	if c.ReadBatchTimeout > 0 {
 		kr.ReadBatchTimeout = c.ReadBatchTimeout
