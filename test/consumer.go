@@ -31,7 +31,7 @@ func main() {
 		fmt.Println(v.Offset)
 		consumer.CommitMessage(v)
 	}
-
+	consumer.Close()
 }
 
 func c2() {

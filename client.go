@@ -88,6 +88,17 @@ func RegisterProduction(name string, pc *ProductionConf) {
 	return
 }
 
+func CloseProduction() error {
+	var e error
+	for _, v := range kafkaProduction {
+		err := v.Close()
+		if err != nil {
+			e = err
+		}
+	}
+	return e
+}
+
 func GetProduction(name string) *Production {
 	return kafkaProduction[name]
 }
@@ -144,6 +155,17 @@ func RegisterConsumer(name string, cc *ConsumerConf) error {
 		c.MaxWait = cc.MaxWait
 	}
 	return nil
+}
+
+func CloseConsumer() error {
+	var e error
+	for _, v := range kafkaConsumer {
+		err := v.Close()
+		if err != nil {
+			e = err
+		}
+	}
+	return e
 }
 
 func GetConsumer(name string) *Consumer {
