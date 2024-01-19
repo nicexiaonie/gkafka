@@ -6,11 +6,18 @@ import (
 )
 
 func main() {
+
+	/*
+	   network: tcp
+	   address: 10.20.0.200:9092
+	   group_id: flow_sync
+
+	*/
 	gkafka.RegisterProduction("demo", &gkafka.ProductionConf{
 		NetWork: "tcp",
 		Address: "10.20.0.200:9092",
 		// 如果不配置topic
-		Topic:     "data_sync_canal_to_clickhouse",
+		Topic:     "data_sync_canal_to_clickhouse_mjdb_mlchangch_end_rec",
 		BatchSize: 1,
 		//消息分发(partition)策略
 		//

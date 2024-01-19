@@ -98,6 +98,27 @@ func (c *Consumer) RunCommit() error {
 	return nil
 }
 
+func (c *Consumer) CommitMessage(m kafka.Message) error {
+	return c.Reader.CommitMessages(c.Ctx, m)
+}
+
+func (c *Consumer) FetchMessage(limit int) ([]kafka.Message, error) {
+
+	ml := make([]kafka.Message, 0)
+	for {
+		m, err := c.Reader.FetchMessage(c.Ctx)
+		if err != nil {
+			return ml, err
+		}
+		ml = append(ml, m)
+
+		if len(ml) >= limit {
+			break
+		}
+	}
+	return ml, nil
+}
+
 func (c *Consumer) Close() error {
 	err := c.Reader.Close()
 	if err != nil {
