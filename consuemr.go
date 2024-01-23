@@ -108,19 +108,13 @@ func (c *Consumer) FetchMessage(limit int, timeout time.Duration) ([]kafka.Messa
 	ctx := context.Background()
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	go func() {
-		select {
-		case <-ctx.Done():
-			c.Reader.Close()
-		}
-	}()
 	ml := make([]kafka.Message, 0)
 	for {
 		select {
 		case <-ticker.C:
 			return ml, nil
 		default:
-			m, err := c.Reader.FetchMessage(c.Ctx)
+			m, err := c.Reader.FetchMessage(ctx)
 			if err != nil {
 				return ml, nil
 			}
