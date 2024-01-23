@@ -105,8 +105,12 @@ func (c *Consumer) CommitMessage(m kafka.Message) error {
 func (c *Consumer) FetchMessage(limit int, timeout time.Duration) ([]kafka.Message, error) {
 	ticker := time.NewTicker(timeout)
 	defer ticker.Stop()
-
+	go func() {
+		time.Sleep(timeout + time.Second)
+		c.Reader.Close()
+	}()
 	ml := make([]kafka.Message, 0)
+
 	for {
 		select {
 		case <-ticker.C:

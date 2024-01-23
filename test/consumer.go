@@ -13,7 +13,7 @@ func main() {
 	_ = gkafka.RegisterConsumer("demo", &gkafka.ConsumerConf{
 		NetWork:          "tcp",
 		Address:          "10.20.0.200:9092",
-		Topic:            "data_sync_canal_to_clickhouse_mjdb_mlchangch_end_rec",
+		Topic:            "data_sync_canal_to_clickhouse_mjdb_changch_user_blocks",
 		GroupId:          "flow_sync",
 		MaxWait:          1 * time.Second,
 		ReadBatchTimeout: 1 * time.Second,
@@ -23,13 +23,15 @@ func main() {
 		},
 	})
 	consumer := gkafka.GetConsumer("demo")
-	list, _ := consumer.FetchMessage(10000000, time.Second*10)
-
-	for _, v := range list {
-
-		fmt.Println(v.Offset)
-		fmt.Println(v.Value)
-	}
+	list, _ := consumer.FetchMessage(10000000, time.Second*3)
+	fmt.Println(len(list))
+	list, _ = consumer.FetchMessage(1, time.Second*10)
+	fmt.Println(len(list))
+	//for _, v := range list {
+	//
+	//	fmt.Println(v.Offset)
+	//	fmt.Println(v.Value)
+	//}
 	consumer.Close()
 }
 
