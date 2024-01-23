@@ -102,28 +102,26 @@ func (c *Consumer) CommitMessage(m kafka.Message) error {
 	return c.Reader.CommitMessages(c.Ctx, m)
 }
 
-func (c *Consumer) FetchMessage(limit int, timeout time.Duration) ([]kafka.Message, error) {
+func (c *Consumer) FetchMessage(ml []*kafka.Message, limit int, timeout time.Duration) error {
 	ticker := time.NewTicker(timeout)
 	defer ticker.Stop()
 	go func() {
 		time.Sleep(timeout + time.Second)
 		c.Reader.Close()
 	}()
-	ml := make([]kafka.Message, 0)
-
 	for {
 		select {
 		case <-ticker.C:
-			return ml, nil
+			return nil
 		default:
 			m, err := c.Reader.FetchMessage(c.Ctx)
 			if err != nil {
-				return ml, err
+				return err
 			}
-			ml = append(ml, m)
+			ml = append(ml, &m)
 
 			if len(ml) >= limit {
-				return ml, nil
+				return nil
 			}
 		}
 	}

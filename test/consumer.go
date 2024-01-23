@@ -23,9 +23,9 @@ func main() {
 		},
 	})
 	consumer := gkafka.GetConsumer("demo")
-	list, _ := consumer.FetchMessage(10000000, time.Second*3)
-	fmt.Println(len(list))
-	list, _ = consumer.FetchMessage(1, time.Second*10)
+	list := make([]*kafka.Message, 0)
+	_ = consumer.FetchMessage(list, 10000000, time.Second*3)
+
 	fmt.Println(len(list))
 	//for _, v := range list {
 	//
