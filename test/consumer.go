@@ -23,13 +23,12 @@ func main() {
 		},
 	})
 	consumer := gkafka.GetConsumer("demo")
-
-	list, _ := consumer.FetchMessage(10)
+	list, _ := consumer.FetchMessage(10000000, time.Second*10)
 
 	for _, v := range list {
 
 		fmt.Println(v.Offset)
-		consumer.CommitMessage(v)
+		fmt.Println(v.Value)
 	}
 	consumer.Close()
 }
