@@ -2,9 +2,14 @@ module github.com/nicexiaonie/gkafka
 
 go 1.25.0
 
-require github.com/IBM/sarama v1.50.3
+require (
+	github.com/IBM/sarama v1.50.3
+	go.opentelemetry.io/otel v1.44.0
+	go.opentelemetry.io/otel/trace v1.44.0
+)
 
 require (
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/eapache/go-resiliency v1.7.0 // indirect
 	github.com/hashicorp/go-uuid v1.0.3 // indirect

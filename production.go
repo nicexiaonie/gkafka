@@ -1,11 +1,13 @@
 package gkafka
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"time"
 
 	"github.com/IBM/sarama"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Production 管理一个 Kafka 连接（sarama.Client），在其之上提供同步与异步两种发送方式。
@@ -30,6 +32,9 @@ type Production struct {
 	AsyncErrHandler func(msg Message, err error)
 	logger          Logger
 
+	Tracing TracingConf
+	tr      tracer
+
 	client sarama.Client
 	sync   sarama.SyncProducer
 	async  sarama.AsyncProducer
@@ -42,6 +47,7 @@ type Production struct {
 // 两者共享该连接与配置。注册时自动调用。
 func (p *Production) Connect() error {
 	p.logger = resolveLogger(p.logger)
+	p.tr = resolveTracing(p.Tracing)
 	cfg, err := buildConfig(p.SASL, p.TLS)
 	if err != nil {
 		return err
@@ -121,17 +127,23 @@ func (p *Production) Connect() error {
 
 // drainAsync 持续读取异步发送的成功/失败结果。
 // 错误必须被消费，否则 sarama 会阻塞；失败走 AsyncErrHandler，未设置则写日志。
+// 若消息关联了 producer span（异步发送时存入 Metadata），在此处回收结束——
+// 异步发送是"投进 channel 即返回"，span 不能在投递时结束，否则测不到真实发送耗时。
 func (p *Production) drainAsync() {
 	for {
 		select {
-		case _, ok := <-p.async.Successes():
+		case s, ok := <-p.async.Successes():
 			if !ok {
 				return
+			}
+			if s != nil {
+				finishProduce(spanFromMetadata(s.Metadata), s.Partition, s.Offset, nil)
 			}
 		case e, ok := <-p.async.Errors():
 			if !ok {
 				return
 			}
+			finishProduce(spanFromMetadata(e.Msg.Metadata), e.Msg.Partition, e.Msg.Offset, e.Err)
 			msg := fromProducerMessage(e.Msg)
 			if p.AsyncErrHandler != nil {
 				p.AsyncErrHandler(msg, e.Err)
@@ -143,38 +155,40 @@ func (p *Production) drainAsync() {
 }
 
 // Send 向默认 Topic 同步发送一条消息，等待 broker 确认后返回，失败返回 error。
-// 分区由注册时的 Balancer 策略决定。
-func (p *Production) Send(key, value string) error {
+// 分区由注册时的 Balancer 策略决定。ctx 用于链路追踪（启用 Tracing 时）与取消传递。
+func (p *Production) Send(ctx context.Context, key, value string) error {
 	if len(p.Topic) == 0 {
 		return errors.New("gkafka: topic is required")
 	}
-	return p.sendSync(p.Topic, false, -1, key, value)
+	return p.sendSync(ctx, p.Topic, false, -1, key, value)
 }
 
 // SendPartition 向默认 Topic 的指定分区 part 同步发送一条消息。
 // 必须在注册时配置 Balancer="manual"，否则返回错误——非 manual 策略下
 // sarama 的分区器会忽略手动指定的分区号，消息会被错路由到别的分区。
-func (p *Production) SendPartition(part int, key, value string) error {
+func (p *Production) SendPartition(ctx context.Context, part int, key, value string) error {
 	if len(p.Topic) == 0 {
 		return errors.New("gkafka: topic is required")
 	}
 	if p.Balancer != BalancerManual {
 		return errors.New(`gkafka: SendPartition requires Balancer="manual"`)
 	}
-	return p.sendSync(p.Topic, true, int32(part), key, value)
+	return p.sendSync(ctx, p.Topic, true, int32(part), key, value)
 }
 
 // SendTopic 向指定的 topic 同步发送一条消息（不使用默认 Topic）。
-func (p *Production) SendTopic(topic, key, value string) error {
+func (p *Production) SendTopic(ctx context.Context, topic, key, value string) error {
 	if len(topic) == 0 {
 		return errors.New("gkafka: topic is required")
 	}
-	return p.sendSync(topic, false, -1, key, value)
+	return p.sendSync(ctx, topic, false, -1, key, value)
 }
 
-// SendAsync 异步高吞吐发送，立即返回不等待。
+// sendAsyncMessage 异步高吞吐发送，立即返回不等待。
 // 成功不另行通知，失败通过注册时的 AsyncErrHandler 回调（未设置则写日志）。
-func (p *Production) sendAsyncMessage(msg *sarama.ProducerMessage) error {
+// 启用 Tracing 时：起 producer span 并注入 header，把 span 暂存于 msg.Metadata，
+// 由 drainAsync 在收到成功/失败结果时回收结束（异步无法在投递时结束 span）。
+func (p *Production) sendAsyncMessage(ctx context.Context, msg *sarama.ProducerMessage) error {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.closed {
@@ -183,29 +197,41 @@ func (p *Production) sendAsyncMessage(msg *sarama.ProducerMessage) error {
 	if p.async == nil {
 		return errors.New("gkafka: production is not connected")
 	}
+	if p.tr.enabled {
+		msg.Metadata = p.tr.startProduce(ctx, msg)
+	}
 	select {
 	case p.async.Input() <- msg:
 		return nil
 	default:
-		return errors.New("gkafka: async producer input is full")
+		// 入队失败，span 不会被 drainAsync 回收，就地结束避免泄漏。
+		finishProduce(spanFromMetadata(msg.Metadata), msg.Partition, msg.Offset, errAsyncInputFull)
+		return errAsyncInputFull
 	}
 }
 
-func (p *Production) SendAsync(topic, key, value string) error {
+var errAsyncInputFull = errors.New("gkafka: async producer input is full")
+
+// SendAsync 向指定 topic 异步发送一条消息，立即返回不等待 broker 确认。
+// topic 为空时回退到注册时的默认 Topic（仍空则返回错误）。
+// 失败通过注册时的 AsyncErrHandler 回调处理；启用 Tracing 时会传递 span。
+func (p *Production) SendAsync(ctx context.Context, topic, key, value string) error {
 	if len(topic) == 0 {
 		topic = p.Topic
 	}
 	if len(topic) == 0 {
 		return errors.New("gkafka: topic is required")
 	}
-	return p.sendAsyncMessage(&sarama.ProducerMessage{
+	return p.sendAsyncMessage(ctx, &sarama.ProducerMessage{
 		Topic: topic,
 		Key:   sarama.StringEncoder(key),
 		Value: sarama.StringEncoder(value),
 	})
 }
 
-func (p *Production) sendSync(topic string, withPartition bool, partition int32, key, value string) error {
+// sendSync 是 Send/SendPartition/SendTopic 的统一内部实现。
+// withPartition=true 时将 partition 写入消息；最终委托给 sendSyncMessage 处理 tracing 与发送。
+func (p *Production) sendSync(ctx context.Context, topic string, withPartition bool, partition int32, key, value string) error {
 	msg := &sarama.ProducerMessage{
 		Topic: topic,
 		Key:   sarama.StringEncoder(key),
@@ -214,10 +240,11 @@ func (p *Production) sendSync(topic string, withPartition bool, partition int32,
 	if withPartition {
 		msg.Partition = partition
 	}
-	return p.sendSyncMessage(msg)
+	return p.sendSyncMessage(ctx, msg)
 }
 
-func (p *Production) sendSyncMessage(msg *sarama.ProducerMessage) error {
+// sendSyncMessage 同步发送一条消息并等待确认。启用 Tracing 时围绕本次发送起止 producer span。
+func (p *Production) sendSyncMessage(ctx context.Context, msg *sarama.ProducerMessage) error {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.closed {
@@ -226,7 +253,12 @@ func (p *Production) sendSyncMessage(msg *sarama.ProducerMessage) error {
 	if p.sync == nil {
 		return errors.New("gkafka: production is not connected")
 	}
-	_, _, err := p.sync.SendMessage(msg)
+	var span trace.Span
+	if p.tr.enabled {
+		span = p.tr.startProduce(ctx, msg)
+	}
+	partition, offset, err := p.sync.SendMessage(msg)
+	finishProduce(span, partition, offset, err)
 	if err != nil {
 		p.logger.Printf("gkafka send err: %v", err)
 		return err
@@ -265,25 +297,28 @@ func (p *Production) toProducerMessage(m Message) (*sarama.ProducerMessage, erro
 // SendMessage 同步发送一条完整的 Message，等待 broker 确认后返回。
 // 支持二进制 Key/Value、透传 Headers；m.Topic 为空时回退到注册时的默认 Topic。
 // m.Partition 仅当 Balancer=manual 时生效（非 manual 策略下由 sarama 自动分配）。
-func (p *Production) SendMessage(m Message) error {
+// ctx 用于链路追踪（启用 Tracing 时）与取消传递。
+func (p *Production) SendMessage(ctx context.Context, m Message) error {
 	msg, err := p.toProducerMessage(m)
 	if err != nil {
 		return err
 	}
-	return p.sendSyncMessage(msg)
+	return p.sendSyncMessage(ctx, msg)
 }
 
 // SendMessageAsync 异步高吞吐发送一条完整的 Message，立即返回不等待。
 // 成功不另行通知，失败通过注册时的 AsyncErrHandler 回调（未设置则写日志）。
 // 字段语义与 SendMessage 一致：支持二进制、Headers 透传、m.Topic 为空回退默认。
-func (p *Production) SendMessageAsync(m Message) error {
+func (p *Production) SendMessageAsync(ctx context.Context, m Message) error {
 	msg, err := p.toProducerMessage(m)
 	if err != nil {
 		return err
 	}
-	return p.sendAsyncMessage(msg)
+	return p.sendAsyncMessage(ctx, msg)
 }
 
+// fromProducerMessage 把 sarama.ProducerMessage 转换为对外的 Message。
+// 用于异步发送失败回调中还原原始消息与发送结果信息。
 func fromProducerMessage(m *sarama.ProducerMessage) Message {
 	out := Message{
 		Topic:     m.Topic,

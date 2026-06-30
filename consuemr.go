@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/IBM/sarama"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Consumer struct {
@@ -37,6 +38,9 @@ type Consumer struct {
 
 	CallFunc func(ctx context.Context, message Message) error
 
+	Tracing TracingConf
+	tr      tracer
+
 	logger Logger
 
 	group sarama.ConsumerGroup
@@ -55,6 +59,7 @@ type Consumer struct {
 // Connect 建立消费组连接并初始化配置。注册时自动调用。缺少 GroupId/Topics 时返回 error。
 func (c *Consumer) Connect() error {
 	c.logger = resolveLogger(c.logger)
+	c.tr = resolveTracing(c.Tracing)
 	if len(c.GroupId) == 0 {
 		return errors.New("gkafka: consumer requires GroupId")
 	}
@@ -186,7 +191,19 @@ func (h *groupHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sara
 			}
 			m := fromConsumerMessage(msg)
 
-			if h.handleAuto(ctx, sess, msg, m) {
+			// 启用 Tracing 时：从消息 header 提取父链路，起 consumer span，
+			// 用带 span 的 ctx 驱动业务处理——CallFunc 在该 ctx 上创建的 span 会挂在其下。
+			// span 覆盖整条消息的处理（含重试），处理结束即结束。
+			mctx := ctx
+			var span trace.Span
+			if c.tr.enabled {
+				mctx, span = c.tr.startConsume(ctx, msg)
+			}
+			commit := h.handleAuto(mctx, sess, msg, m)
+			if span != nil {
+				span.End()
+			}
+			if commit {
 				sess.MarkMessage(msg, "")
 			}
 		case <-sess.Context().Done():
@@ -265,6 +282,8 @@ func (c *Consumer) toDLQ(msg *sarama.ConsumerMessage, attempt int, cause error) 
 	return err
 }
 
+// toDLQMessage 将消费失败的消息转换为发往 DLQTopic 的 ProducerMessage。
+// 原始 Headers 全部保留，并追加 gkafka-dlq-* 诊断 header 记录来源、重试次数与错误。
 func (c *Consumer) toDLQMessage(msg *sarama.ConsumerMessage, attempt int, cause error) *sarama.ProducerMessage {
 	causeText := ""
 	if cause != nil {

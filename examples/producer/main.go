@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+
 	"github.com/nicexiaonie/gkafka"
 )
 
@@ -27,14 +29,16 @@ func main() {
 
 	production := gkafka.GetProduction("demo")
 
+	ctx := context.Background()
+
 	// 默认发送配置的topic
-	//production.Send("1111", "11111")
+	//production.Send(ctx, "1111", "11111")
 
 	// 发送默认topic 指定分区
-	//production.SendPartition(2, "1111", "11111")
+	//production.SendPartition(ctx, 2, "1111", "11111")
 
 	// 可以指定topic发送
-	production.SendTopic("data_sync_canal_to_clickhouse", "test", "test")
+	production.SendTopic(ctx, "data_sync_canal_to_clickhouse", "test", "test")
 
 	_ = production.Close()
 }

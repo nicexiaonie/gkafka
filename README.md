@@ -14,7 +14,9 @@
 go get github.com/nicexiaonie/gkafka
 ```
 
-依赖：`github.com/IBM/sarama`。要求 Go 1.25+（随 sarama v1.50.3 依赖）。SCRAM 认证所需的客户端实现由调用方自行引入（见 SASL 章节）。
+依赖：`github.com/IBM/sarama`，以及 OpenTelemetry 链路追踪核心库 `go.opentelemetry.io/otel`（trace + propagation API）。要求 Go 1.25+（随 sarama v1.50.3 依赖）。SCRAM 认证所需的客户端实现由调用方自行引入（见 SASL 章节）。
+
+> OTel 仅是 **API 依赖**，不引入任何具体后端（Jaeger/Zipkin 等）。不配置 `Tracing` 时全程不创建 span、不读写 header，零运行时开销（见链路追踪章节）。
 
 ## 快速开始
 
@@ -31,11 +33,14 @@ if err != nil {
 }
 
 p := gkafka.GetProduction("demo")
-p.Send("key", "value")                       // 发默认 topic
-p.SendTopic("other_topic", "key", "value")   // 发指定 topic
-p.SendPartition(0, "key", "value")           // 发默认 topic 指定分区（仅当 Balancer="manual"）
-p.SendAsync("my_topic", "key", "value")      // 异步高吞吐发送
+ctx := context.Background() // 接链路追踪时传入携带上游 span 的 ctx
+p.Send(ctx, "key", "value")                       // 发默认 topic
+p.SendTopic(ctx, "other_topic", "key", "value")   // 发指定 topic
+p.SendPartition(ctx, 0, "key", "value")           // 发默认 topic 指定分区（仅当 Balancer="manual"）
+p.SendAsync(ctx, "my_topic", "key", "value")      // 异步高吞吐发送
 ```
+
+> 所有发送方法的首参均为 `context.Context`。不接链路追踪时传 `context.Background()` 即可；接入后传携带上游 span 的 ctx，框架会自动把链路注入消息 header（见链路追踪章节）。
 
 ### 消费者（自动模式）
 
@@ -76,6 +81,7 @@ c.RunCommit() // 阻塞运行，自动消费 + 自动提交
 | `BatchTimeout` | Duration | 距上次发送超时则强制发出 | 约 1s |
 | `WriteTimeout` | Duration | 单次网络写超时 | sarama 默认 |
 | `AsyncErrHandler` | func(Message, error) | 异步发送错误回调，不设则写日志 | 写日志 |
+| `Tracing` | TracingConf | 链路追踪配置，见链路追踪章节；零值（`TracerProvider` 为 nil）= 关闭 | 关闭 |
 | `Logger` | Logger | 日志输出，不设用标准库 log | 标准 log |
 
 ### 分区策略 `Balancer`
@@ -106,13 +112,15 @@ c.RunCommit() // 阻塞运行，自动消费 + 自动提交
 
 | 方法 | 模式 | 说明 |
 |---|---|---|
-| `Send(key, value)` | 同步 | 发默认 topic，等确认返回 error |
-| `SendPartition(part, key, value)` | 同步 | 发默认 topic 指定分区（需 `Balancer="manual"`，否则返回错误） |
-| `SendTopic(topic, key, value)` | 同步 | 发指定 topic |
-| `SendAsync(topic, key, value)` | 异步 | 高吞吐，立即返回，错误走 `AsyncErrHandler` |
-| `SendMessage(m Message)` | 同步 | 发完整 Message（支持二进制 Key/Value 与 Headers），`m.Topic` 为空走默认 |
-| `SendMessageAsync(m Message)` | 异步 | 同上，异步版 |
+| `Send(ctx, key, value)` | 同步 | 发默认 topic，等确认返回 error |
+| `SendPartition(ctx, part, key, value)` | 同步 | 发默认 topic 指定分区（需 `Balancer="manual"`，否则返回错误） |
+| `SendTopic(ctx, topic, key, value)` | 同步 | 发指定 topic |
+| `SendAsync(ctx, topic, key, value)` | 异步 | 高吞吐，立即返回，错误走 `AsyncErrHandler` |
+| `SendMessage(ctx, m Message)` | 同步 | 发完整 Message（支持二进制 Key/Value 与 Headers），`m.Topic` 为空走默认 |
+| `SendMessageAsync(ctx, m Message)` | 异步 | 同上，异步版 |
 | `Close()` | - | 关闭并刷出缓冲消息 |
+
+> **所有发送方法首参为 `context.Context`**：用于链路追踪上下文传递与取消信号。不接 trace 时传 `context.Background()`。
 
 > **简单字符串场景**用 `Send` / `SendTopic` / `SendAsync` 等便利方法。
 > **需要 Headers**(trace 透传、租户 ID、消息元数据等)或 **value 是二进制**(protobuf / 压缩 / 加密)时,改用 `SendMessage` / `SendMessageAsync`——它们直接收 `Message`,`Key` / `Value` 是 `[]byte`,`Headers` 透传到 broker。`m.Partition` 仅在 `Balancer="manual"` 时生效。
@@ -139,6 +147,7 @@ c.RunCommit() // 阻塞运行，自动消费 + 自动提交
 | `DLQTopic` | string | 死信 topic，`OnExceed=OnExceedDLQ` 时必填 | - |
 | `InitialOffset` | InitialOffset | 新组首次消费起点，见下文 | `OffsetOldest` |
 | `CallFunc` | func(ctx, Message) error | 业务处理函数，返回 nil 提交、返回 error 原地重试 | - |
+| `Tracing` | TracingConf | 链路追踪配置，见链路追踪章节；零值 = 关闭 | 关闭 |
 | `Logger` | Logger | 日志输出，不设用标准库 log | 标准 log |
 
 > 同一 `GroupId` 的多个实例会自动分摊分区（rebalance）；不同 `GroupId` 各自独立消费全量。
@@ -306,6 +315,80 @@ TLS: gkafka.TLSConf{
 | `Enable` | 是否启用 TLS，`false`（默认）= 明文 |
 | `Config` | `*tls.Config`（Go 标准库），nil 且 `Enable=true` 时用系统默认校验 |
 
+## 链路追踪（Tracing）
+
+基于 [OpenTelemetry](https://opentelemetry.io/) 的分布式链路追踪。Kafka 在调用链里是个天然断点——生产者发完即返回，消费者在另一进程、另一时刻才处理。本库做的就是把链路上下文（W3C `traceparent`/`tracestate`）**在生产侧打包进消息 header、随消息送达消费侧、再拆出来续上链路**，使一次跨 Kafka 的调用在 trace 后端串成完整的一条。
+
+**设计原则：默认关闭、零侵入、不绑后端。**
+
+- **默认关闭**：`TracerProvider` 为 nil（零值）时，整套逻辑完全空转——不创建 span、不读写 header、无任何运行时开销与行为变化。
+- **不绑后端**：只依赖 OTel 的 trace/propagation **API**，业务用什么后端（Jaeger、Zipkin、SkyWalking 等经 OTel 接入）都行。
+- **业务无感 header**：`traceparent` 的注入/提取由框架完成，业务代码不接触 header。
+
+### 配置 `TracingConf`
+
+生产/消费的 `Tracing` 字段通用。
+
+| 字段 | 类型 | 说明 | 默认 |
+|---|---|---|---|
+| `TracerProvider` | trace.TracerProvider | 提供 Tracer；为 nil = **关闭 trace** | nil（关闭） |
+| `Propagator` | propagation.TextMapPropagator | header 上的注入/提取策略 | nil 时用 W3C TraceContext |
+
+通常传 `otel.GetTracerProvider()`（已全局初始化 OTel SDK 时）或自建的 SDK provider。`Propagator` 留空即用 W3C 标准 `traceparent`/`tracestate`，与主流后端兼容。
+
+### 生产侧
+
+发送方法的首参 `ctx` 携带上游 span，框架在发送前从 ctx 提取 span 注入消息 header，并为本次发送创建一个 producer span。
+
+```go
+err := gkafka.RegisterProduction("demo", &gkafka.ProductionConf{
+    Brokers: []string{"127.0.0.1:9092"},
+    Topic:   "my_topic",
+    Tracing: gkafka.TracingConf{
+        TracerProvider: otel.GetTracerProvider(), // 启用
+        // Propagator 留空 = W3C TraceContext
+    },
+})
+// ...
+p := gkafka.GetProduction("demo")
+
+// ctx 携带上游 span（如来自 HTTP 入站、上一段业务 span）
+p.SendMessage(ctx, gkafka.Message{Value: []byte("payload")})
+```
+
+> **同步 vs 异步的 span 生命周期**：同步发送的 producer span 在 `SendMessage` 返回（拿到分区/offset 或 error）后立即结束；异步发送（`SendAsync`/`SendMessageAsync`）是"投进队列即返回"，span 不在投递时结束，而是由后台在收到 broker 的成功/失败结果时结束——这样 span 才能反映真实的发送耗时与结果。
+
+### 消费侧
+
+消费侧无需改任何调用代码：开启 `Tracing` 后，框架从消息 header 提取父链路、创建 consumer span，并把带 span 的 ctx 传给 `CallFunc`。业务在该 ctx 上创建的下游 span（DB、RPC 等）会自动挂在 consumer span 之下。
+
+```go
+err := gkafka.RegisterConsumer("demo", &gkafka.ConsumerConf{
+    Brokers: []string{"127.0.0.1:9092"},
+    Topics:  []string{"my_topic"},
+    GroupId: "my_group",
+    Tracing: gkafka.TracingConf{
+        TracerProvider: otel.GetTracerProvider(),
+    },
+    CallFunc: func(ctx context.Context, m gkafka.Message) error {
+        // ctx 已挂在 consumer span 下；在此 ctx 上起子 span 即自动归入同一条链路
+        return handle(ctx, m)
+    },
+})
+```
+
+> consumer span 覆盖**整条消息的处理过程**（含重试），在 `CallFunc` 最终成功、跳过或转入死信后结束。
+
+### 工作原理小结
+
+| 环节 | 动作 | 载体 |
+|---|---|---|
+| 生产 | 从 ctx 提取 span → 注入 header → 起 producer span | `messaging` 语义属性 + `traceparent` header |
+| 传输 | header 随消息存入 broker、随消息送达消费侧 | Kafka 消息 header |
+| 消费 | 从 header 提取父 span → 起 consumer span → 注入传给 `CallFunc` 的 ctx | — |
+
+> **死信消息的链路**：转入 DLQ 的消息保留原始 header，因此 DLQ 消费者读到的是**原始生产者**的链路上下文（而非失败那次的 consumer span）——便于回溯消息最初的来源。
+
 ## 消息类型 `Message`
 
 业务函数收到的中性消息类型（不暴露 sarama 类型）：
@@ -317,7 +400,7 @@ type Message struct {
     Offset    int64
     Key       []byte
     Value     []byte
-    Headers   []Header // 键值对，为后续 trace 预留载体
+    Headers   []Header // 键值对；trace 上下文（traceparent 等）经此透传
 }
 
 type Header struct {
@@ -353,6 +436,8 @@ type Header struct {
 | 失败处理 | 无限重试（写死） | `MaxRetry` + `OnExceed` 可配 |
 | 日志 | 写死标准 log | `Logger` 可注入 |
 | 生产连接 | — | 同步/异步共享一个底层连接与配置 |
+| 发送方法签名 | `Send(key, value)` 等 | **首参加 `ctx`**：`Send(ctx, key, value)` 等（链路追踪/取消传递） |
+| 链路追踪 | 无 | OpenTelemetry，生产注入/消费提取，默认关闭零开销 |
 
 
 

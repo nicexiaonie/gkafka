@@ -237,6 +237,11 @@ type ProductionConf struct {
 	// 不设置时默认写日志，绝不静默吞掉错误。同步发送（Send 系列）不走此回调，直接返回 error。
 	AsyncErrHandler func(msg Message, err error)
 
+	// Tracing 分布式链路追踪配置。为零值（TracerProvider 为 nil）时关闭，零开销、行为不变。
+	// 启用后，发送方法（Send 系列，均需传入 ctx）会把链路上下文注入消息 header，
+	// 消费端可据此续上链路。详见 TracingConf。
+	Tracing TracingConf
+
 	// Logger 日志输出。为 nil 时使用默认实现（标准库 log）。详见 Logger 接口。
 	Logger Logger
 }
@@ -304,6 +309,11 @@ type ConsumerConf struct {
 	// ctx 携带 ConsumerConf.Ctx 的值，并在 Close/rebalance 时被取消——长处理可监听 ctx.Done() 提前退出。
 	CallFunc func(ctx context.Context, message Message) error
 
+	// Tracing 分布式链路追踪配置。为零值（TracerProvider 为 nil）时关闭，零开销、行为不变。
+	// 启用后，框架会从消息 header 提取链路上下文、起 consumer span，并通过传给
+	// CallFunc 的 ctx 下传——业务在该 ctx 上创建的 span 会自动挂在消费 span 之下。详见 TracingConf。
+	Tracing TracingConf
+
 	// Logger 日志输出。为 nil 时使用默认实现（标准库 log）。详见 Logger 接口。
 	Logger Logger
 }
@@ -338,6 +348,7 @@ func RegisterProduction(name string, pc *ProductionConf) error {
 		BatchTimeout:    pc.BatchTimeout,
 		WriteTimeout:    pc.WriteTimeout,
 		AsyncErrHandler: pc.AsyncErrHandler,
+		Tracing:         pc.Tracing,
 		logger:          resolveLogger(pc.Logger),
 	}
 	if err := p.Connect(); err != nil {
@@ -427,6 +438,7 @@ func RegisterConsumer(name string, cc *ConsumerConf) error {
 		DLQTopic:      cc.DLQTopic,
 		InitialOffset: cc.InitialOffset,
 		CallFunc:      cc.CallFunc,
+		Tracing:       cc.Tracing,
 		logger:        resolveLogger(cc.Logger),
 	}
 	if err := c.Connect(); err != nil {

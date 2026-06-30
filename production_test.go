@@ -1,6 +1,7 @@
 package gkafka
 
 import (
+	"context"
 	"testing"
 
 	"github.com/IBM/sarama"
@@ -35,7 +36,7 @@ func TestFromProducerMessage_NilKeyValue(t *testing.T) {
 func TestSendPartition_RequiresManual(t *testing.T) {
 	for _, balancer := range []Balancer{"", BalancerHash, BalancerRoundRobin, BalancerRandom, BalancerReferenceHash} {
 		p := &Production{Topic: "t", Balancer: balancer}
-		if err := p.SendPartition(0, "k", "v"); err == nil {
+		if err := p.SendPartition(context.Background(), 0, "k", "v"); err == nil {
 			t.Errorf("Balancer=%q 时 SendPartition 应返回错误", balancer)
 		}
 	}
@@ -103,35 +104,35 @@ func TestToProducerMessage_NoHeaders(t *testing.T) {
 // 因此构造未 Connect 的 Production 即可断言。
 func TestSendMessage_EmptyTopic(t *testing.T) {
 	p := &Production{}
-	if err := p.SendMessage(Message{}); err == nil {
+	if err := p.SendMessage(context.Background(), Message{}); err == nil {
 		t.Error("Topic 为空时 SendMessage 应返回错误")
 	}
 }
 
 func TestSend_NotConnected(t *testing.T) {
 	p := &Production{Topic: "t"}
-	if err := p.Send("k", "v"); err == nil {
+	if err := p.Send(context.Background(), "k", "v"); err == nil {
 		t.Fatal("expected error when production is not connected, got nil")
 	}
 }
 
 func TestSendMessage_NotConnected(t *testing.T) {
 	p := &Production{Topic: "t"}
-	if err := p.SendMessage(Message{Value: []byte("v")}); err == nil {
+	if err := p.SendMessage(context.Background(), Message{Value: []byte("v")}); err == nil {
 		t.Fatal("expected error when production is not connected, got nil")
 	}
 }
 
 func TestSendAsync_NotConnected(t *testing.T) {
 	p := &Production{Topic: "t"}
-	if err := p.SendAsync("", "k", "v"); err == nil {
+	if err := p.SendAsync(context.Background(), "", "k", "v"); err == nil {
 		t.Fatal("expected error when production is not connected, got nil")
 	}
 }
 
 func TestSendMessageAsync_NotConnected(t *testing.T) {
 	p := &Production{Topic: "t"}
-	if err := p.SendMessageAsync(Message{Value: []byte("v")}); err == nil {
+	if err := p.SendMessageAsync(context.Background(), Message{Value: []byte("v")}); err == nil {
 		t.Fatal("expected error when production is not connected, got nil")
 	}
 }
