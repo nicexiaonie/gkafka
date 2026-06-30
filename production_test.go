@@ -108,9 +108,40 @@ func TestSendMessage_EmptyTopic(t *testing.T) {
 	}
 }
 
-func TestSendMessageAsync_EmptyTopic(t *testing.T) {
+func TestSend_NotConnected(t *testing.T) {
+	p := &Production{Topic: "t"}
+	if err := p.Send("k", "v"); err == nil {
+		t.Fatal("expected error when production is not connected, got nil")
+	}
+}
+
+func TestSendMessage_NotConnected(t *testing.T) {
+	p := &Production{Topic: "t"}
+	if err := p.SendMessage(Message{Value: []byte("v")}); err == nil {
+		t.Fatal("expected error when production is not connected, got nil")
+	}
+}
+
+func TestSendAsync_NotConnected(t *testing.T) {
+	p := &Production{Topic: "t"}
+	if err := p.SendAsync("", "k", "v"); err == nil {
+		t.Fatal("expected error when production is not connected, got nil")
+	}
+}
+
+func TestSendMessageAsync_NotConnected(t *testing.T) {
+	p := &Production{Topic: "t"}
+	if err := p.SendMessageAsync(Message{Value: []byte("v")}); err == nil {
+		t.Fatal("expected error when production is not connected, got nil")
+	}
+}
+
+func TestClose_Idempotent(t *testing.T) {
 	p := &Production{}
-	if err := p.SendMessageAsync(Message{}); err == nil {
-		t.Error("Topic 为空时 SendMessageAsync 应返回错误")
+	if err := p.Close(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("unexpected error on second close: %v", err)
 	}
 }

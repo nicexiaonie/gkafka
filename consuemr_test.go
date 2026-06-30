@@ -2,7 +2,10 @@ package gkafka
 
 import (
 	"context"
+	"errors"
 	"testing"
+
+	"github.com/IBM/sarama"
 )
 
 func TestValidateRetryPolicy(t *testing.T) {
@@ -37,6 +40,68 @@ func TestValidateRetryPolicy(t *testing.T) {
 }
 
 type ctxKey string
+
+func TestToDLQMessage_PreservesHeadersAndAddsMetadata(t *testing.T) {
+	c := &Consumer{DLQTopic: "dlq"}
+	src := &sarama.ConsumerMessage{
+		Topic:     "source_topic",
+		Partition: 3,
+		Offset:    42,
+		Key:       []byte("k"),
+		Value:     []byte("v"),
+		Headers: []*sarama.RecordHeader{
+			{Key: []byte("traceparent"), Value: []byte("trace-1")},
+		},
+	}
+
+	msg := c.toDLQMessage(src, 5, errors.New("boom"))
+
+	if msg.Topic != "dlq" {
+		t.Fatalf("Topic=%s, want dlq", msg.Topic)
+	}
+	if k, _ := msg.Key.Encode(); string(k) != "k" {
+		t.Fatalf("Key=%s, want k", string(k))
+	}
+	if v, _ := msg.Value.Encode(); string(v) != "v" {
+		t.Fatalf("Value=%s, want v", string(v))
+	}
+
+	headers := make(map[string]string, len(msg.Headers))
+	for _, h := range msg.Headers {
+		headers[string(h.Key)] = string(h.Value)
+	}
+	cases := map[string]string{
+		"traceparent":                 "trace-1",
+		"gkafka-dlq-source-topic":     "source_topic",
+		"gkafka-dlq-source-partition": "3",
+		"gkafka-dlq-source-offset":    "42",
+		"gkafka-dlq-attempt":          "5",
+		"gkafka-dlq-error":            "boom",
+	}
+	for key, want := range cases {
+		if got := headers[key]; got != want {
+			t.Fatalf("header %s=%q, want %q", key, got, want)
+		}
+	}
+}
+
+func TestToDLQMessage_NilCause(t *testing.T) {
+	c := &Consumer{DLQTopic: "dlq"}
+	msg := c.toDLQMessage(&sarama.ConsumerMessage{Topic: "source"}, 1, nil)
+
+	for _, h := range msg.Headers {
+		if string(h.Key) == "gkafka-dlq-error" && string(h.Value) != "" {
+			t.Fatalf("gkafka-dlq-error=%q, want empty", string(h.Value))
+		}
+	}
+}
+
+func TestRunCommit_NotConnected(t *testing.T) {
+	c := &Consumer{CallFunc: func(context.Context, Message) error { return nil }}
+	if err := c.RunCommit(); err == nil {
+		t.Fatal("expected error when consumer is not connected, got nil")
+	}
+}
 
 func TestMergeCtx_FallbackToCancelCtx(t *testing.T) {
 	cancelCtx := context.Background()

@@ -10,8 +10,7 @@ import (
 func main() {
 
 	_ = gkafka.RegisterConsumer("demo", &gkafka.ConsumerConf{
-		NetWork: "tcp",
-		Address: "10.20.0.200:9092",
+		Brokers: []string{"10.20.0.200:9092"},
 		Topics:  []string{"data_sync_canal_to_clickhouse_mjdb_mlchangch_end_rec"},
 		GroupId: "flow_sync",
 		MaxWait: 1 * time.Second,
@@ -33,8 +32,7 @@ func main() {
 func c2() {
 	// http://kafka.xingdong.co/
 	err := gkafka.RegisterConsumer("demo2", &gkafka.ConsumerConf{
-		NetWork: "tcp",
-		Address: "10.20.0.200:9092",
+		Brokers: []string{"10.20.0.200:9092"},
 		Topics:  []string{"data_sync_canal_to_clickhouse"},
 		GroupId: "game_room_server",
 		MaxWait: 1 * time.Second,

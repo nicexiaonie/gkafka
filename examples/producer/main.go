@@ -13,8 +13,7 @@ func main() {
 
 	*/
 	err := gkafka.RegisterProduction("demo", &gkafka.ProductionConf{
-		NetWork: "tcp",
-		Address: "10.20.0.200:9092",
+		Brokers: []string{"10.20.0.200:9092"},
 		// 如果不配置topic
 		Topic:     "data_sync_canal_to_clickhouse_mjdb_mlchangch_end_rec",
 		BatchSize: 1,

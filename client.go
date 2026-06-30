@@ -82,9 +82,7 @@ const (
 	SASLGSSAPI      SASLMechanism = "gssapi"
 )
 
-// OnExceed 是消费端超过 MaxRetry 后的处理动作类型，配合下面 OnExceed* 常量使用。
-// 留空（零值）仅当 MaxRetry=0 时合法（表示无限重试）。
-// OnExceed 是超过 MaxRetry 后的处理动作类型，推荐用 OnExceedSkip / OnExceedDLQ 常量。
+// OnExceed 是达到 MaxRetry 后的处理动作类型，推荐用 OnExceedSkip / OnExceedDLQ 常量。
 // 留空（零值）仅当 MaxRetry=0 时合法（表示无限重试）。
 type OnExceed string
 
@@ -188,10 +186,12 @@ var (
 
 // ProductionConf 生产者注册配置。
 type ProductionConf struct {
-	// NetWork 连接网络类型，一般为 "tcp"。留空默认 "tcp"。
+	// NetWork 已废弃：sarama 当前连接入口不使用该字段，保留仅为兼容旧配置。
 	NetWork string
-	// Address broker 地址，格式 "host:port"，如 "10.20.0.200:9092"。必填。
+	// Address 已废弃：单 broker 地址，保留仅为兼容旧配置。推荐使用 Brokers。
 	Address string
+	// Brokers broker 地址列表，格式 []string{"host1:port", "host2:port"}。生产环境建议至少配置两个 bootstrap broker。
+	Brokers []string
 	// Topic 默认发送的 topic。Send / SendPartition 使用此 topic；
 	// SendTopic / SendAsync 可显式指定其它 topic。
 	Topic string
@@ -243,10 +243,12 @@ type ProductionConf struct {
 
 // ConsumerConf 消费者注册配置。
 type ConsumerConf struct {
-	// NetWork 连接网络类型，一般为 "tcp"。留空默认 "tcp"。
+	// NetWork 已废弃：sarama 当前连接入口不使用该字段，保留仅为兼容旧配置。
 	NetWork string
-	// Address broker 地址，格式 "host:port"。必填。
+	// Address 已废弃：单 broker 地址，保留仅为兼容旧配置。推荐使用 Brokers。
 	Address string
+	// Brokers broker 地址列表，格式 []string{"host1:port", "host2:port"}。生产环境建议至少配置两个 bootstrap broker。
+	Brokers []string
 	// Topics 要消费的 topic 列表。至少一个。同一消费组可同时消费多个 topic。
 	Topics []string
 	// GroupId 消费组 ID。必填。
@@ -312,6 +314,9 @@ type ConsumerConf struct {
 // 同名重注册会拒绝并返回错误——要替换请先调用 CloseProductionByName(name) 显式关闭旧实例。
 // 这样设计是避免静默泄漏旧连接与后台协程。
 func RegisterProduction(name string, pc *ProductionConf) error {
+	if pc == nil {
+		return errors.New("gkafka: ProductionConf is required")
+	}
 	mu.RLock()
 	_, exists := kafkaProduction[name]
 	mu.RUnlock()
@@ -321,6 +326,7 @@ func RegisterProduction(name string, pc *ProductionConf) error {
 	p := &Production{
 		NetWork:         pc.NetWork,
 		Address:         pc.Address,
+		Brokers:         pc.Brokers,
 		Topic:           pc.Topic,
 		Balancer:        pc.Balancer,
 		Acks:            pc.Acks,
@@ -395,6 +401,9 @@ func GetProduction(name string) *Production {
 //
 // 同名重注册会拒绝并返回错误——要替换请先调用 CloseConsumerByName(name) 显式关闭旧实例。
 func RegisterConsumer(name string, cc *ConsumerConf) error {
+	if cc == nil {
+		return errors.New("gkafka: ConsumerConf is required")
+	}
 	mu.RLock()
 	_, exists := kafkaConsumer[name]
 	mu.RUnlock()
@@ -402,22 +411,23 @@ func RegisterConsumer(name string, cc *ConsumerConf) error {
 		return errors.New("gkafka: consumer already registered: " + name + " (call CloseConsumerByName first)")
 	}
 	c := &Consumer{
-		NetWork:        cc.NetWork,
-		Address:        cc.Address,
-		Topics:         cc.Topics,
-		GroupId:        cc.GroupId,
-		userCtx:        cc.Ctx,
-		MinBytes:       cc.MinBytes,
-		MaxBytes:       cc.MaxBytes,
-		MaxWait:        cc.MaxWait,
-		SASL:           cc.SASL,
-		TLS:            cc.TLS,
-		MaxRetry:       cc.MaxRetry,
-		OnExceed:       cc.OnExceed,
-		DLQTopic:       cc.DLQTopic,
-		InitialOffset:  cc.InitialOffset,
-		CallFunc:       cc.CallFunc,
-		logger:         resolveLogger(cc.Logger),
+		NetWork:       cc.NetWork,
+		Address:       cc.Address,
+		Brokers:       cc.Brokers,
+		Topics:        cc.Topics,
+		GroupId:       cc.GroupId,
+		userCtx:       cc.Ctx,
+		MinBytes:      cc.MinBytes,
+		MaxBytes:      cc.MaxBytes,
+		MaxWait:       cc.MaxWait,
+		SASL:          cc.SASL,
+		TLS:           cc.TLS,
+		MaxRetry:      cc.MaxRetry,
+		OnExceed:      cc.OnExceed,
+		DLQTopic:      cc.DLQTopic,
+		InitialOffset: cc.InitialOffset,
+		CallFunc:      cc.CallFunc,
+		logger:        resolveLogger(cc.Logger),
 	}
 	if err := c.Connect(); err != nil {
 		return err
@@ -471,6 +481,17 @@ func GetConsumer(name string) *Consumer {
 	mu.RLock()
 	defer mu.RUnlock()
 	return kafkaConsumer[name]
+}
+
+// resolveBrokers 返回 sarama 使用的 broker 列表。Brokers 优先；为空时回退到旧 Address 字段。
+func resolveBrokers(brokers []string, address string) ([]string, error) {
+	if len(brokers) > 0 {
+		return brokers, nil
+	}
+	if len(address) > 0 {
+		return []string{address}, nil
+	}
+	return nil, errors.New("gkafka: Brokers or Address is required")
 }
 
 // buildConfig 构造 sarama 基础配置，生产/消费共用认证、加密与版本设置。

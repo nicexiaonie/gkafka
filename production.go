@@ -2,6 +2,7 @@ package gkafka
 
 import (
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/IBM/sarama"
@@ -12,6 +13,7 @@ import (
 type Production struct {
 	NetWork string
 	Address string
+	Brokers []string
 	Topic   string
 
 	Balancer   Balancer
@@ -31,15 +33,15 @@ type Production struct {
 	client sarama.Client
 	sync   sarama.SyncProducer
 	async  sarama.AsyncProducer
+
+	mu     sync.RWMutex
+	closed bool
 }
 
 // Connect 建立底层连接（一个 sarama.Client），并在其之上派生同步与异步 producer。
 // 两者共享该连接与配置。注册时自动调用。
 func (p *Production) Connect() error {
 	p.logger = resolveLogger(p.logger)
-	if len(p.NetWork) == 0 {
-		p.NetWork = "tcp"
-	}
 	cfg, err := buildConfig(p.SASL, p.TLS)
 	if err != nil {
 		return err
@@ -84,7 +86,12 @@ func (p *Production) Connect() error {
 		cfg.Net.WriteTimeout = p.WriteTimeout
 	}
 
-	client, err := sarama.NewClient([]string{p.Address}, cfg)
+	brokers, err := resolveBrokers(p.Brokers, p.Address)
+	if err != nil {
+		return err
+	}
+
+	client, err := sarama.NewClient(brokers, cfg)
 	if err != nil {
 		return err
 	}
@@ -105,6 +112,7 @@ func (p *Production) Connect() error {
 	p.client = client
 	p.sync = sp
 	p.async = ap
+	p.closed = false
 	go p.drainAsync()
 
 	p.logger.Printf("gkafka Connect production: addr=%s topic=%s", p.Address, p.Topic)
@@ -166,6 +174,23 @@ func (p *Production) SendTopic(topic, key, value string) error {
 
 // SendAsync 异步高吞吐发送，立即返回不等待。
 // 成功不另行通知，失败通过注册时的 AsyncErrHandler 回调（未设置则写日志）。
+func (p *Production) sendAsyncMessage(msg *sarama.ProducerMessage) error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.closed {
+		return errors.New("gkafka: production is closed")
+	}
+	if p.async == nil {
+		return errors.New("gkafka: production is not connected")
+	}
+	select {
+	case p.async.Input() <- msg:
+		return nil
+	default:
+		return errors.New("gkafka: async producer input is full")
+	}
+}
+
 func (p *Production) SendAsync(topic, key, value string) error {
 	if len(topic) == 0 {
 		topic = p.Topic
@@ -173,12 +198,11 @@ func (p *Production) SendAsync(topic, key, value string) error {
 	if len(topic) == 0 {
 		return errors.New("gkafka: topic is required")
 	}
-	p.async.Input() <- &sarama.ProducerMessage{
+	return p.sendAsyncMessage(&sarama.ProducerMessage{
 		Topic: topic,
 		Key:   sarama.StringEncoder(key),
 		Value: sarama.StringEncoder(value),
-	}
-	return nil
+	})
 }
 
 func (p *Production) sendSync(topic string, withPartition bool, partition int32, key, value string) error {
@@ -189,6 +213,18 @@ func (p *Production) sendSync(topic string, withPartition bool, partition int32,
 	}
 	if withPartition {
 		msg.Partition = partition
+	}
+	return p.sendSyncMessage(msg)
+}
+
+func (p *Production) sendSyncMessage(msg *sarama.ProducerMessage) error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.closed {
+		return errors.New("gkafka: production is closed")
+	}
+	if p.sync == nil {
+		return errors.New("gkafka: production is not connected")
 	}
 	_, _, err := p.sync.SendMessage(msg)
 	if err != nil {
@@ -234,12 +270,7 @@ func (p *Production) SendMessage(m Message) error {
 	if err != nil {
 		return err
 	}
-	_, _, err = p.sync.SendMessage(msg)
-	if err != nil {
-		p.logger.Printf("gkafka send err: %v", err)
-		return err
-	}
-	return nil
+	return p.sendSyncMessage(msg)
 }
 
 // SendMessageAsync 异步高吞吐发送一条完整的 Message，立即返回不等待。
@@ -250,8 +281,7 @@ func (p *Production) SendMessageAsync(m Message) error {
 	if err != nil {
 		return err
 	}
-	p.async.Input() <- msg
-	return nil
+	return p.sendAsyncMessage(msg)
 }
 
 func fromProducerMessage(m *sarama.ProducerMessage) Message {
@@ -276,19 +306,33 @@ func fromProducerMessage(m *sarama.ProducerMessage) Message {
 // Close 关闭同步与异步 producer（刷出缓冲消息），最后关闭共享的底层连接。
 // 顺序固定：先关 producer 再关 client。返回过程中出现的最后一个错误。
 func (p *Production) Close() error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+	p.closed = true
+	syncProducer := p.sync
+	asyncProducer := p.async
+	client := p.client
+	p.sync = nil
+	p.async = nil
+	p.client = nil
+	p.mu.Unlock()
+
 	var e error
-	if p.sync != nil {
-		if err := p.sync.Close(); err != nil {
+	if syncProducer != nil {
+		if err := syncProducer.Close(); err != nil {
 			e = err
 		}
 	}
-	if p.async != nil {
-		if err := p.async.Close(); err != nil {
+	if asyncProducer != nil {
+		if err := asyncProducer.Close(); err != nil {
 			e = err
 		}
 	}
-	if p.client != nil {
-		if err := p.client.Close(); err != nil {
+	if client != nil {
+		if err := client.Close(); err != nil {
 			e = err
 		}
 	}

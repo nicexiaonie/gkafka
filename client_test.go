@@ -106,9 +106,9 @@ func TestInitialOffsetFor(t *testing.T) {
 // fakeSCRAMClient 是 buildConfig 测试用的 SCRAM 客户端占位实现。
 type fakeSCRAMClient struct{}
 
-func (fakeSCRAMClient) Begin(_, _, _ string) error      { return nil }
-func (fakeSCRAMClient) Step(_ string) (string, error)   { return "", nil }
-func (fakeSCRAMClient) Done() bool                       { return true }
+func (fakeSCRAMClient) Begin(_, _, _ string) error    { return nil }
+func (fakeSCRAMClient) Step(_ string) (string, error) { return "", nil }
+func (fakeSCRAMClient) Done() bool                    { return true }
 
 // fakeTokenProvider 是 buildConfig 测试用的 OAuth token 占位实现。
 type fakeTokenProvider struct{}
@@ -223,6 +223,40 @@ func TestResolveLogger(t *testing.T) {
 	custom := &recordingLogger{}
 	if got := resolveLogger(custom); got != custom {
 		t.Error("非 nil 应原样返回，而非回退")
+	}
+}
+
+func TestResolveBrokers(t *testing.T) {
+	brokers, err := resolveBrokers([]string{"127.0.0.1:9092", "127.0.0.2:9092"}, "127.0.0.3:9092")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(brokers) != 2 || brokers[0] != "127.0.0.1:9092" || brokers[1] != "127.0.0.2:9092" {
+		t.Fatalf("Brokers 优先级错误: %+v", brokers)
+	}
+
+	brokers, err = resolveBrokers(nil, "127.0.0.3:9092")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(brokers) != 1 || brokers[0] != "127.0.0.3:9092" {
+		t.Fatalf("Address 回退错误: %+v", brokers)
+	}
+
+	if _, err := resolveBrokers(nil, ""); err == nil {
+		t.Fatal("Brokers 和 Address 都为空时应返回错误")
+	}
+}
+
+func TestRegisterProduction_NilConfig(t *testing.T) {
+	if err := RegisterProduction("test_nil_prod", nil); err == nil {
+		t.Fatal("expected error when config is nil, got nil")
+	}
+}
+
+func TestRegisterConsumer_NilConfig(t *testing.T) {
+	if err := RegisterConsumer("test_nil_cons", nil); err == nil {
+		t.Fatal("expected error when config is nil, got nil")
 	}
 }
 

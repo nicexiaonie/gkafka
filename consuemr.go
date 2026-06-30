@@ -9,6 +9,7 @@ package gkafka
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 type Consumer struct {
 	NetWork string
 	Address string
+	Brokers []string
 	Topics  []string
 	GroupId string
 
@@ -53,9 +55,6 @@ type Consumer struct {
 // Connect 建立消费组连接并初始化配置。注册时自动调用。缺少 GroupId/Topics 时返回 error。
 func (c *Consumer) Connect() error {
 	c.logger = resolveLogger(c.logger)
-	if len(c.NetWork) == 0 {
-		c.NetWork = "tcp"
-	}
 	if len(c.GroupId) == 0 {
 		return errors.New("gkafka: consumer requires GroupId")
 	}
@@ -90,7 +89,12 @@ func (c *Consumer) Connect() error {
 		cfg.Consumer.MaxWaitTime = c.MaxWait
 	}
 
-	group, err := sarama.NewConsumerGroup([]string{c.Address}, c.GroupId, cfg)
+	brokers, err := resolveBrokers(c.Brokers, c.Address)
+	if err != nil {
+		return err
+	}
+
+	group, err := sarama.NewConsumerGroup(brokers, c.GroupId, cfg)
 	if err != nil {
 		return err
 	}
@@ -140,6 +144,9 @@ func (c *Consumer) validateRetryPolicy() error {
 func (c *Consumer) RunCommit() error {
 	if c.CallFunc == nil {
 		return errors.New("gkafka: CallFunc is required")
+	}
+	if c.group == nil {
+		return errors.New("gkafka: consumer is not connected")
 	}
 
 	h := &groupHandler{c: c}
@@ -207,7 +214,7 @@ func (h *groupHandler) handleAuto(ctx context.Context, sess sarama.ConsumerGroup
 					attempt, m.Topic, m.Partition, m.Offset, err)
 				return true // 提交 = 跳过，会丢这条
 			case OnExceedDLQ:
-				if derr := c.toDLQ(raw); derr != nil {
+				if derr := c.toDLQ(raw, attempt, err); derr != nil {
 					c.logger.Printf("gkafka send to DLQ failed, keep retrying: %v", derr)
 					// 死信失败不提交，继续重试，避免丢消息。
 				} else {
@@ -230,8 +237,8 @@ func (h *groupHandler) handleAuto(ctx context.Context, sess sarama.ConsumerGroup
 	}
 }
 
-// toDLQ 把处理不动的消息原样投递到死信 topic。
-func (c *Consumer) toDLQ(msg *sarama.ConsumerMessage) error {
+// toDLQ 把处理不动的消息投递到死信 topic，保留原始 Key/Value/Headers，并追加来源与失败信息。
+func (c *Consumer) toDLQ(msg *sarama.ConsumerMessage, attempt int, cause error) error {
 	if len(c.DLQTopic) == 0 {
 		return errors.New("gkafka: OnExceed=dlq requires DLQTopic")
 	}
@@ -244,17 +251,46 @@ func (c *Consumer) toDLQ(msg *sarama.ConsumerMessage) error {
 		pcfg.Producer.Return.Successes = true
 		pcfg.Producer.Return.Errors = true
 		pcfg.Producer.RequiredAcks = sarama.WaitForLocal
-		c.dlq, c.dlqErr = sarama.NewSyncProducer([]string{c.Address}, pcfg)
+		brokers, err := resolveBrokers(c.Brokers, c.Address)
+		if err != nil {
+			c.dlqErr = err
+			return
+		}
+		c.dlq, c.dlqErr = sarama.NewSyncProducer(brokers, pcfg)
 	})
 	if c.dlqErr != nil {
 		return c.dlqErr
 	}
-	_, _, err := c.dlq.SendMessage(&sarama.ProducerMessage{
+	_, _, err := c.dlq.SendMessage(c.toDLQMessage(msg, attempt, cause))
+	return err
+}
+
+func (c *Consumer) toDLQMessage(msg *sarama.ConsumerMessage, attempt int, cause error) *sarama.ProducerMessage {
+	causeText := ""
+	if cause != nil {
+		causeText = cause.Error()
+	}
+	out := &sarama.ProducerMessage{
 		Topic: c.DLQTopic,
 		Key:   sarama.ByteEncoder(msg.Key),
 		Value: sarama.ByteEncoder(msg.Value),
-	})
-	return err
+	}
+	if len(msg.Headers) > 0 {
+		out.Headers = make([]sarama.RecordHeader, 0, len(msg.Headers)+5)
+		for _, h := range msg.Headers {
+			out.Headers = append(out.Headers, sarama.RecordHeader{Key: h.Key, Value: h.Value})
+		}
+	} else {
+		out.Headers = make([]sarama.RecordHeader, 0, 5)
+	}
+	out.Headers = append(out.Headers,
+		sarama.RecordHeader{Key: []byte("gkafka-dlq-source-topic"), Value: []byte(msg.Topic)},
+		sarama.RecordHeader{Key: []byte("gkafka-dlq-source-partition"), Value: []byte(strconv.FormatInt(int64(msg.Partition), 10))},
+		sarama.RecordHeader{Key: []byte("gkafka-dlq-source-offset"), Value: []byte(strconv.FormatInt(msg.Offset, 10))},
+		sarama.RecordHeader{Key: []byte("gkafka-dlq-attempt"), Value: []byte(strconv.Itoa(attempt))},
+		sarama.RecordHeader{Key: []byte("gkafka-dlq-error"), Value: []byte(causeText)},
+	)
+	return out
 }
 
 // Close 取消消费循环并关闭消费组与死信生产者。返回过程中出现的最后一个错误。

@@ -22,8 +22,7 @@ go get github.com/nicexiaonie/gkafka
 
 ```go
 err := gkafka.RegisterProduction("demo", &gkafka.ProductionConf{
-    NetWork:  "tcp",
-    Address:  "127.0.0.1:9092",
+    Brokers:  []string{"127.0.0.1:9092"},
     Topic:    "my_topic",
     Balancer: gkafka.BalancerRoundRobin,
 })
@@ -42,8 +41,7 @@ p.SendAsync("my_topic", "key", "value")      // 异步高吞吐发送
 
 ```go
 err := gkafka.RegisterConsumer("demo", &gkafka.ConsumerConf{
-    NetWork: "tcp",
-    Address: "127.0.0.1:9092",
+    Brokers: []string{"127.0.0.1:9092"},
     Topics:  []string{"my_topic"},
     GroupId: "my_group",
     CallFunc: func(ctx context.Context, m gkafka.Message) error {
@@ -64,8 +62,9 @@ c.RunCommit() // 阻塞运行，自动消费 + 自动提交
 
 | 字段 | 类型 | 说明 | 默认 |
 |---|---|---|---|
-| `NetWork` | string | 连接网络类型，一般 `"tcp"` | `"tcp"` |
-| `Address` | string | broker 地址 `host:port`，**必填** | - |
+| `NetWork` | string | 已废弃：sarama 当前连接入口不使用该字段，保留仅为兼容旧配置 | - |
+| `Address` | string | 已废弃：单 broker 地址，保留仅为兼容旧配置；推荐使用 `Brokers` | - |
+| `Brokers` | []string | broker 地址列表，生产环境建议至少配置两个 bootstrap broker | - |
 | `Topic` | string | 默认 topic，`Send`/`SendPartition` 使用 | - |
 | `Balancer` | Balancer | 分区策略，见下表 | `BalancerRandom` |
 | `Acks` | Acks | 发送确认级别，见下表 | `AcksLocal` |
@@ -124,8 +123,9 @@ c.RunCommit() // 阻塞运行，自动消费 + 自动提交
 
 | 字段 | 类型 | 说明 | 默认 |
 |---|---|---|---|
-| `NetWork` | string | 连接网络类型 | `"tcp"` |
-| `Address` | string | broker 地址，**必填** | - |
+| `NetWork` | string | 已废弃：sarama 当前连接入口不使用该字段，保留仅为兼容旧配置 | - |
+| `Address` | string | 已废弃：单 broker 地址，保留仅为兼容旧配置；推荐使用 `Brokers` | - |
+| `Brokers` | []string | broker 地址列表，生产环境建议至少配置两个 bootstrap broker | - |
 | `Topics` | []string | 要消费的 topic 列表，**至少一个**（支持多 topic） | - |
 | `GroupId` | string | 消费组 ID，**必填** | - |
 | `Ctx` | context.Context | 业务上下文（传值），传入 `CallFunc` 的 ctx 以它为父 | `Background` |
@@ -173,7 +173,7 @@ c.RunCommit() // 阻塞运行，自动消费 + 自动提交
 
 重试退避：前 3 次立即重试，超过 3 次每次间隔 1s，超过 100 次每次间隔 5s。
 
-> **死信队列**：把处理不动的消息原样搬到另一个 topic 后提交 offset，主流程继续。既不丢也不卡，但死信 topic 里的消息需自行写程序消费或人工处理，否则只是换个地方堆积。死信投递本身失败时不提交、继续重试，避免丢消息。
+> **死信队列**：把处理不动的消息投递到另一个 topic 后提交 offset，主流程继续。死信消息会保留原始 Key/Value/Headers，并追加 `gkafka-dlq-source-topic`、`gkafka-dlq-source-partition`、`gkafka-dlq-source-offset`、`gkafka-dlq-attempt`、`gkafka-dlq-error` headers 方便排查。既不丢也不卡，但死信 topic 里的消息需自行写程序消费或人工处理，否则只是换个地方堆积。死信投递本身失败时不提交、继续重试，避免丢消息。
 
 ### 消费起点 `InitialOffset`
 
