@@ -197,7 +197,10 @@ func (c *Consumer) RunCommit() error {
 				return nil
 			}
 			c.logger.Printf("gkafka consume error, will retry: %v", err)
-			time.Sleep(time.Second)
+			// 等待期间 Close 则立即退出，不拖慢关闭。
+			if !waitCtx(c.lifeCtx, time.Second) {
+				return nil
+			}
 		}
 		if c.lifeCtx.Err() != nil {
 			return nil
@@ -276,16 +279,31 @@ func (h *groupHandler) handleAuto(ctx context.Context, sess sarama.ConsumerGroup
 			}
 		}
 
-		// 退避：与旧实现保持一致。
+		// 退避：与旧实现保持一致。等待期间 session 被取消（Close/rebalance）则立即停止，不提交。
+		var backoff time.Duration
 		if attempt > 100 {
-			time.Sleep(5 * time.Second)
+			backoff = 5 * time.Second
 		} else if attempt > 3 {
-			time.Sleep(1 * time.Second)
+			backoff = 1 * time.Second
 		}
-
-		if sess.Context().Err() != nil {
+		if !waitCtx(sess.Context(), backoff) {
 			return false
 		}
+	}
+}
+
+// waitCtx 等待 d 时长，期间 ctx 结束则提前返回。返回 true 表示等满且 ctx 仍未结束。
+func waitCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return ctx.Err() == nil
+	case <-ctx.Done():
+		return false
 	}
 }
 

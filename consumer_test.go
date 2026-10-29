@@ -355,6 +355,7 @@ func TestConsumeClaim_SessionCanceledStopsRetry(t *testing.T) {
 type fakeGroup struct {
 	sarama.ConsumerGroup
 	settle     time.Duration
+	consumeErr error // 非 nil 时 Consume 立即返回该错误，模拟消费出错
 	mu         sync.Mutex
 	events     []string
 	closeCalls int32
@@ -367,6 +368,9 @@ func (g *fakeGroup) record(e string) {
 }
 
 func (g *fakeGroup) Consume(ctx context.Context, _ []string, _ sarama.ConsumerGroupHandler) error {
+	if g.consumeErr != nil {
+		return g.consumeErr
+	}
 	<-ctx.Done()
 	time.Sleep(g.settle)
 	g.record("consume-done")
@@ -565,5 +569,52 @@ func TestConsumerConnect_NoDLQProducerWithoutDLQ(t *testing.T) {
 			t.Errorf("OnExceed=%q 时不应创建 dlq", oe.onExceed)
 		}
 		_ = c.Close()
+	}
+}
+
+// 重试退避等待期间 session 被取消时应立即停止，而不是等满退避时长。
+func TestConsumeClaim_BackoffStopsOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	c := &Consumer{CallFunc: func(context.Context, Message) error {
+		calls++
+		if calls == 4 { // 第 4 次失败后将进入 1s 退避
+			cancel()
+		}
+		return errors.New("boom")
+	}}
+
+	start := time.Now()
+	marked := runClaim(t, ctx, c, &sarama.ConsumerMessage{Topic: "t"})
+
+	if d := time.Since(start); d > 300*time.Millisecond {
+		t.Fatalf("取消后仍等待了 %v，退避未响应取消", d)
+	}
+	if calls != 4 {
+		t.Errorf("calls=%d, want 4", calls)
+	}
+	if len(marked) != 0 {
+		t.Errorf("len(marked)=%d, want 0", len(marked))
+	}
+}
+
+// RunCommit 在消费出错后的等待期间被 Close 时应立即退出。
+func TestRunCommit_ErrorWaitStopsOnClose(t *testing.T) {
+	g := &fakeGroup{consumeErr: errors.New("consume failed")}
+	c := newFakeGroupConsumer(g)
+	runDone := make(chan error, 1)
+	go func() { runDone <- c.RunCommit() }()
+	time.Sleep(50 * time.Millisecond) // 确保 RunCommit 已进入出错后的等待
+
+	start := time.Now()
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Fatalf("Close 耗时 %v，RunCommit 出错等待未响应关闭", d)
+	}
+	if err := <-runDone; err != nil {
+		t.Fatalf("RunCommit: %v", err)
 	}
 }
