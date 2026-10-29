@@ -205,7 +205,13 @@ func TestSendPartition_SetsPartition(t *testing.T) {
 	_ = sp.Close()
 }
 
-// 异步测试结束时直接关闭 mock，不走 Production.Close。
+// startDrain 模拟 Connect 中异步部分的装配：挂上 ap 并启动 drainAsync。
+func startDrain(p *Production, ap sarama.AsyncProducer) {
+	p.async = ap
+	p.drained = make(chan struct{})
+	go p.drainAsync(ap, p.drained)
+}
+
 func TestSendAsync_ErrorGoesToHandler(t *testing.T) {
 	errBoom := errors.New("boom")
 	ap := mocks.NewAsyncProducer(t, nil)
@@ -217,13 +223,12 @@ func TestSendAsync_ErrorGoesToHandler(t *testing.T) {
 	got := make(chan result, 1)
 	p := &Production{
 		Topic:  "t",
-		async:  ap,
 		logger: &recordingLogger{},
 		AsyncErrHandler: func(msg Message, err error) {
 			got <- result{msg, err}
 		},
 	}
-	go p.drainAsync()
+	startDrain(p, ap)
 
 	if err := p.SendAsync(context.Background(), "", "k", "v"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -239,15 +244,17 @@ func TestSendAsync_ErrorGoesToHandler(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("AsyncErrHandler 未被调用")
 	}
-	_ = ap.Close()
+	if err := p.Close(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func TestSendAsync_ErrorDefaultsToLogger(t *testing.T) {
 	ap := mocks.NewAsyncProducer(t, nil)
 	ap.ExpectInputAndFail(errors.New("boom"))
 	logs := make(chanLogger, 1)
-	p := &Production{Topic: "t", async: ap, logger: logs}
-	go p.drainAsync()
+	p := &Production{Topic: "t", logger: logs}
+	startDrain(p, ap)
 
 	if err := p.SendAsync(context.Background(), "", "k", "v"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -260,5 +267,66 @@ func TestSendAsync_ErrorDefaultsToLogger(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("未设置 AsyncErrHandler 时应写日志")
 	}
-	_ = ap.Close()
+	if err := p.Close(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// closingAsync 模拟真实 sarama 关闭行为：AsyncClose 后仍有在途消息的结果送达，
+// 送完才关闭两个结果通道；Close 则像 sarama 一样自行读走剩余结果。
+type closingAsync struct {
+	sarama.AsyncProducer
+	succ chan *sarama.ProducerMessage
+	errs chan *sarama.ProducerError
+	late error
+}
+
+func newClosingAsync(late error) *closingAsync {
+	return &closingAsync{
+		succ: make(chan *sarama.ProducerMessage),
+		errs: make(chan *sarama.ProducerError),
+		late: late,
+	}
+}
+
+func (a *closingAsync) Successes() <-chan *sarama.ProducerMessage { return a.succ }
+func (a *closingAsync) Errors() <-chan *sarama.ProducerError      { return a.errs }
+
+func (a *closingAsync) AsyncClose() {
+	go func() {
+		a.succ <- &sarama.ProducerMessage{Topic: "t"}
+		a.errs <- &sarama.ProducerError{Msg: &sarama.ProducerMessage{Topic: "t", Key: sarama.StringEncoder("k")}, Err: a.late}
+		close(a.errs)
+		close(a.succ)
+	}()
+}
+
+func (a *closingAsync) Close() error {
+	a.AsyncClose()
+	go func() {
+		for range a.succ {
+		}
+	}()
+	for range a.errs {
+	}
+	return nil
+}
+
+// 关闭期间送达的结果必须全部由 drainAsync 处理：不崩溃，且失败结果交给 AsyncErrHandler。
+func TestClose_DrainsInflightResults(t *testing.T) {
+	errLate := errors.New("late")
+	ap := newClosingAsync(errLate)
+	var got []error
+	p := &Production{
+		logger:          &recordingLogger{},
+		AsyncErrHandler: func(_ Message, err error) { got = append(got, err) },
+	}
+	startDrain(p, ap)
+
+	if err := p.Close(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 || !errors.Is(got[0], errLate) {
+		t.Fatalf("AsyncErrHandler 收到 %v, want [%v]", got, errLate)
+	}
 }

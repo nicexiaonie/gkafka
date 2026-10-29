@@ -38,6 +38,8 @@ type Production struct {
 	client sarama.Client
 	sync   sarama.SyncProducer
 	async  sarama.AsyncProducer
+	// drained 在 drainAsync 读完异步结果并退出时关闭，Close 据此等待结果处理完毕。
+	drained chan struct{}
 
 	mu     sync.RWMutex
 	closed bool
@@ -118,8 +120,9 @@ func (p *Production) Connect() error {
 	p.client = client
 	p.sync = sp
 	p.async = ap
+	p.drained = make(chan struct{})
 	p.closed = false
-	go p.drainAsync()
+	go p.drainAsync(ap, p.drained)
 
 	p.logger.Printf("gkafka Connect production: brokers=%v topic=%s", brokers, p.Topic)
 	return nil
@@ -129,19 +132,25 @@ func (p *Production) Connect() error {
 // 错误必须被消费，否则 sarama 会阻塞；失败走 AsyncErrHandler，未设置则写日志。
 // 若消息关联了 producer span（异步发送时存入 Metadata），在此处回收结束——
 // 异步发送是"投进 channel 即返回"，span 不能在投递时结束，否则测不到真实发送耗时。
-func (p *Production) drainAsync() {
-	for {
+// 只读取启动时传入的 ap，直到其成功/失败两个通道都关闭才退出，退出时关闭 done。
+// 它是结果的唯一读者：Close 期间在途消息的结果也由这里处理，不会被 sarama 代读而漏掉回调。
+func (p *Production) drainAsync(ap sarama.AsyncProducer, done chan struct{}) {
+	defer close(done)
+	successes, errs := ap.Successes(), ap.Errors()
+	for successes != nil || errs != nil {
 		select {
-		case s, ok := <-p.async.Successes():
+		case s, ok := <-successes:
 			if !ok {
-				return
+				successes = nil
+				continue
 			}
 			if s != nil {
 				finishProduce(spanFromMetadata(s.Metadata), s.Partition, s.Offset, nil)
 			}
-		case e, ok := <-p.async.Errors():
+		case e, ok := <-errs:
 			if !ok {
-				return
+				errs = nil
+				continue
 			}
 			finishProduce(spanFromMetadata(e.Msg.Metadata), e.Msg.Partition, e.Msg.Offset, e.Err)
 			msg := fromProducerMessage(e.Msg)
@@ -338,8 +347,10 @@ func fromProducerMessage(m *sarama.ProducerMessage) Message {
 	return out
 }
 
-// Close 关闭同步与异步 producer（刷出缓冲消息），最后关闭共享的底层连接。
-// 顺序固定：先关 producer 再关 client。返回过程中出现的最后一个错误。
+// Close 关闭异步与同步 producer（刷出缓冲消息），最后关闭共享的底层连接。
+// 顺序固定：先异步、再同步、最后 client。异步 producer 只发起关闭（AsyncClose），
+// 并等待 drainAsync 处理完在途消息的结果——期间的失败仍走 AsyncErrHandler，
+// 因此不会出现在本方法的返回值中。返回同步 producer 与 client 关闭时的最后一个错误。
 func (p *Production) Close() error {
 	p.mu.Lock()
 	if p.closed {
@@ -349,20 +360,21 @@ func (p *Production) Close() error {
 	p.closed = true
 	syncProducer := p.sync
 	asyncProducer := p.async
+	drained := p.drained
 	client := p.client
 	p.sync = nil
 	p.async = nil
+	p.drained = nil
 	p.client = nil
 	p.mu.Unlock()
 
+	if asyncProducer != nil {
+		asyncProducer.AsyncClose()
+		<-drained
+	}
 	var e error
 	if syncProducer != nil {
 		if err := syncProducer.Close(); err != nil {
-			e = err
-		}
-	}
-	if asyncProducer != nil {
-		if err := asyncProducer.Close(); err != nil {
 			e = err
 		}
 	}

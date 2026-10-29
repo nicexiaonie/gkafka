@@ -80,7 +80,7 @@ c.RunCommit() // 阻塞运行，自动消费 + 自动提交
 | `BatchBytes` | int | 攒够多少字节触发发送 | sarama 默认 |
 | `BatchTimeout` | Duration | 距上次发送超时则强制发出 | 约 1s |
 | `WriteTimeout` | Duration | 单次网络写超时 | sarama 默认 |
-| `AsyncErrHandler` | func(Message, error) | 异步发送错误回调，不设则写日志 | 写日志 |
+| `AsyncErrHandler` | func(Message, error) | 异步发送错误回调，不设则写日志。回调在 gkafka 内部的单个后台协程中逐条执行，见下方“`AsyncErrHandler` 不要阻塞” | 写日志 |
 | `Tracing` | TracingConf | 链路追踪配置，见链路追踪章节；零值（`TracerProvider` 为 nil）= 关闭 | 关闭 |
 | `Logger` | Logger | 日志输出，不设用标准库 log | 标准 log |
 
@@ -118,7 +118,7 @@ c.RunCommit() // 阻塞运行，自动消费 + 自动提交
 | `SendAsync(ctx, topic, key, value)` | 异步 | 高吞吐，立即返回，错误走 `AsyncErrHandler` |
 | `SendMessage(ctx, m Message)` | 同步 | 发完整 Message（支持二进制 Key/Value 与 Headers），`m.Topic` 为空走默认 |
 | `SendMessageAsync(ctx, m Message)` | 异步 | 同上，异步版 |
-| `Close()` | - | 关闭并刷出缓冲消息 |
+| `Close()` | - | 关闭并刷出缓冲消息；期间异步发送的失败仍走 `AsyncErrHandler`，不计入返回值 |
 
 > **所有发送方法首参为 `context.Context`**：用于链路追踪上下文传递与取消信号。不接 trace 时传 `context.Background()`。
 
@@ -126,6 +126,12 @@ c.RunCommit() // 阻塞运行，自动消费 + 自动提交
 > **需要 Headers**(trace 透传、租户 ID、消息元数据等)或 **value 是二进制**(protobuf / 压缩 / 加密)时,改用 `SendMessage` / `SendMessageAsync`——它们直接收 `Message`,`Key` / `Value` 是 `[]byte`,`Headers` 透传到 broker。`m.Partition` 仅在 `Balancer="manual"` 时生效。
 
 > **同步 vs 异步**：`Send` 系列阻塞等 broker 确认，失败直接返回 error；`SendAsync` 不等待，吞吐更高，但发出那一刻不代表已落盘——成功不通知，失败异步回调。用异步务必处理 `AsyncErrHandler`。
+
+> **`AsyncErrHandler` 不要阻塞**：回调在 gkafka 内部的单个后台协程中逐条执行，执行完一条才会读取下一条发送结果。回调耗时过长会造成两个后果：
+> - **平时**：发送结果积压，sarama 无法继续发送，异步发送队列被占满，后续 `SendAsync` / `SendMessageAsync` 会直接返回队列已满的错误。
+> - **关闭时**：`Close()` 会等关闭期间所有回调执行完才返回；回调越慢，服务退出越慢，回调卡死则 `Close()` 不返回。
+>
+> 回调里只做快速操作（打日志、计数、把失败消息放入业务自己的队列），耗时处理（写库、调接口、重发）交给业务自己的协程异步完成。
 
 ## 消费者配置 `ConsumerConf`
 
