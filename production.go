@@ -3,6 +3,7 @@ package gkafka
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -193,11 +194,18 @@ func (p *Production) SendTopic(ctx context.Context, topic, key, value string) er
 	return p.sendSync(ctx, topic, false, -1, key, value)
 }
 
-// sendAsyncMessage 异步高吞吐发送，立即返回不等待。
-// 成功不另行通知，失败通过注册时的 AsyncErrHandler 回调（未设置则写日志）。
+// sendAsyncMessage 异步高吞吐发送：等 sarama 接收消息即返回，不等待 broker 确认。
+// sarama 的异步入口通道无缓冲，平时接收只需微秒级；仅当 sarama 内部积压时才会等待（反压）。
+// ctx 结束（取消/超时）时放弃等待并返回包装了 ctx.Err() 的错误，消息不会交给 sarama，
+// 也不走 AsyncErrHandler；ctx 为 nil 时视为不限时等待。
+// 等待期间持有读锁，保证 Close 发起 AsyncClose 之后不会再有消息写入入口通道。
+// 成功不另行通知，broker 侧失败通过注册时的 AsyncErrHandler 回调（未设置则写日志）。
 // 启用 Tracing 时：起 producer span 并注入 header，把 span 暂存于 msg.Metadata，
 // 由 drainAsync 在收到成功/失败结果时回收结束（异步无法在投递时结束 span）。
 func (p *Production) sendAsyncMessage(ctx context.Context, msg *sarama.ProducerMessage) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.closed {
@@ -206,24 +214,28 @@ func (p *Production) sendAsyncMessage(ctx context.Context, msg *sarama.ProducerM
 	if p.async == nil {
 		return errors.New("gkafka: production is not connected")
 	}
+	// 先判断 ctx 是否已结束：否则 ctx 已结束且 sarama 恰好空闲时，select 会随机选择分支。
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("gkafka: async send canceled: %w", err)
+	}
 	if p.tr.enabled {
 		msg.Metadata = p.tr.startProduce(ctx, msg)
 	}
 	select {
 	case p.async.Input() <- msg:
 		return nil
-	default:
-		// 入队失败，span 不会被 drainAsync 回收，就地结束避免泄漏。
-		finishProduce(spanFromMetadata(msg.Metadata), msg.Partition, msg.Offset, errAsyncInputFull)
-		return errAsyncInputFull
+	case <-ctx.Done():
+		err := fmt.Errorf("gkafka: async send canceled: %w", ctx.Err())
+		// 未交给 sarama，span 不会被 drainAsync 回收，就地结束避免泄漏。
+		finishProduce(spanFromMetadata(msg.Metadata), msg.Partition, msg.Offset, err)
+		return err
 	}
 }
 
-var errAsyncInputFull = errors.New("gkafka: async producer input is full")
-
-// SendAsync 向指定 topic 异步发送一条消息，立即返回不等待 broker 确认。
+// SendAsync 向指定 topic 异步发送一条消息：等 sarama 接收即返回，不等待 broker 确认。
+// sarama 积压时会等待，可通过 ctx 的超时/取消控制最长等待时间。
 // topic 为空时回退到注册时的默认 Topic（仍空则返回错误）。
-// 失败通过注册时的 AsyncErrHandler 回调处理；启用 Tracing 时会传递 span。
+// broker 侧失败通过注册时的 AsyncErrHandler 回调处理；启用 Tracing 时会传递 span。
 func (p *Production) SendAsync(ctx context.Context, topic, key, value string) error {
 	if len(topic) == 0 {
 		topic = p.Topic
@@ -315,8 +327,9 @@ func (p *Production) SendMessage(ctx context.Context, m Message) error {
 	return p.sendSyncMessage(ctx, msg)
 }
 
-// SendMessageAsync 异步高吞吐发送一条完整的 Message，立即返回不等待。
-// 成功不另行通知，失败通过注册时的 AsyncErrHandler 回调（未设置则写日志）。
+// SendMessageAsync 异步高吞吐发送一条完整的 Message：等 sarama 接收即返回，不等待 broker 确认。
+// sarama 积压时会等待，可通过 ctx 的超时/取消控制最长等待时间。
+// 成功不另行通知，broker 侧失败通过注册时的 AsyncErrHandler 回调（未设置则写日志）。
 // 字段语义与 SendMessage 一致：支持二进制、Headers 透传、m.Topic 为空回退默认。
 func (p *Production) SendMessageAsync(ctx context.Context, m Message) error {
 	msg, err := p.toProducerMessage(m)

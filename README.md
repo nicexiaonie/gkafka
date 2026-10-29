@@ -115,9 +115,9 @@ c.RunCommit() // 阻塞运行，自动消费 + 自动提交
 | `Send(ctx, key, value)` | 同步 | 发默认 topic，等确认返回 error |
 | `SendPartition(ctx, part, key, value)` | 同步 | 发默认 topic 指定分区（需 `Balancer="manual"`，否则返回错误） |
 | `SendTopic(ctx, topic, key, value)` | 同步 | 发指定 topic |
-| `SendAsync(ctx, topic, key, value)` | 异步 | 高吞吐，立即返回，错误走 `AsyncErrHandler` |
+| `SendAsync(ctx, topic, key, value)` | 异步 | 高吞吐，等 sarama 接收即返回、不等 broker 确认；积压时等待，可用 ctx 超时控制；broker 侧错误走 `AsyncErrHandler` |
 | `SendMessage(ctx, m Message)` | 同步 | 发完整 Message（支持二进制 Key/Value 与 Headers），`m.Topic` 为空走默认 |
-| `SendMessageAsync(ctx, m Message)` | 异步 | 同上，异步版 |
+| `SendMessageAsync(ctx, m Message)` | 异步 | 同上，异步版（等待与错误语义同 `SendAsync`） |
 | `Close()` | - | 关闭并刷出缓冲消息；期间异步发送的失败仍走 `AsyncErrHandler`，不计入返回值 |
 
 > **所有发送方法首参为 `context.Context`**：用于链路追踪上下文传递与取消信号。不接 trace 时传 `context.Background()`。
@@ -125,10 +125,12 @@ c.RunCommit() // 阻塞运行，自动消费 + 自动提交
 > **简单字符串场景**用 `Send` / `SendTopic` / `SendAsync` 等便利方法。
 > **需要 Headers**(trace 透传、租户 ID、消息元数据等)或 **value 是二进制**(protobuf / 压缩 / 加密)时,改用 `SendMessage` / `SendMessageAsync`——它们直接收 `Message`,`Key` / `Value` 是 `[]byte`,`Headers` 透传到 broker。`m.Partition` 仅在 `Balancer="manual"` 时生效。
 
-> **同步 vs 异步**：`Send` 系列阻塞等 broker 确认，失败直接返回 error；`SendAsync` 不等待，吞吐更高，但发出那一刻不代表已落盘——成功不通知，失败异步回调。用异步务必处理 `AsyncErrHandler`。
+> **同步 vs 异步**：`Send` 系列要等 sarama 接收、再等 broker 返回这条消息的结果（毫秒级），失败直接返回 error；`SendAsync` 系列只等 sarama 接收（平时微秒级）即返回，吞吐更高，但返回那一刻不代表已落盘——成功不通知，broker 侧失败异步回调。用异步务必处理 `AsyncErrHandler`。
+>
+> **异步发送的等待与超时**：sarama 内部积压（broker 慢或不可达、`AsyncErrHandler` 处理过慢等）时，异步发送会等待 sarama 接收（反压），而不是丢弃消息。ctx 取消或超时则放弃等待并返回错误（可用 `errors.Is(err, context.DeadlineExceeded)` / `context.Canceled` 判断），此时消息未交给 sarama，也不会走 `AsyncErrHandler`，需由调用方自行处理。对延迟敏感的场景请给 ctx 设置超时。
 
 > **`AsyncErrHandler` 不要阻塞**：回调在 gkafka 内部的单个后台协程中逐条执行，执行完一条才会读取下一条发送结果。回调耗时过长会造成两个后果：
-> - **平时**：发送结果积压，sarama 无法继续发送，异步发送队列被占满，后续 `SendAsync` / `SendMessageAsync` 会直接返回队列已满的错误。
+> - **平时**：发送结果积压，sarama 无法继续接收新消息，后续 `SendAsync` / `SendMessageAsync` 会被拖慢、等待（ctx 设了超时则超时返回错误）。
 > - **关闭时**：`Close()` 会等关闭期间所有回调执行完才返回；回调越慢，服务退出越慢，回调卡死则 `Close()` 不返回。
 >
 > 回调里只做快速操作（打日志、计数、把失败消息放入业务自己的队列），耗时处理（写库、调接口、重发）交给业务自己的协程异步完成。

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -328,5 +330,161 @@ func TestClose_DrainsInflightResults(t *testing.T) {
 	}
 	if len(got) != 1 || !errors.Is(got[0], errLate) {
 		t.Fatalf("AsyncErrHandler 收到 %v, want [%v]", got, errLate)
+	}
+}
+
+// newMockBrokerProduction 用 sarama 模拟 broker 驱动真实的 sarama producer，
+// 与 mocks.AsyncProducer 不同，其异步入口通道与生产环境一样是无缓冲的。
+func newMockBrokerProduction(t *testing.T, onErr func(Message, error)) *Production {
+	t.Helper()
+	mb := sarama.NewMockBroker(t, 1)
+	t.Cleanup(mb.Close)
+	mb.SetHandlerByMap(map[string]sarama.MockResponse{
+		"ApiVersionsRequest": sarama.NewMockApiVersionsResponse(t),
+		"MetadataRequest": sarama.NewMockMetadataResponse(t).
+			SetBroker(mb.Addr(), mb.BrokerID()).
+			SetLeader("t", 0, mb.BrokerID()),
+		"ProduceRequest": sarama.NewMockProduceResponse(t),
+	})
+	p := &Production{Brokers: []string{mb.Addr()}, Topic: "t", logger: &recordingLogger{}, AsyncErrHandler: onErr}
+	if err := p.Connect(); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	return p
+}
+
+// 连续与并发异步发送不应因 sarama 正在处理上一条消息而失败。
+func TestSendAsync_BurstWithRealProducer(t *testing.T) {
+	var handlerCalls int64
+	p := newMockBrokerProduction(t, func(Message, error) { atomic.AddInt64(&handlerCalls, 1) })
+
+	const n = 2000
+	for i := 0; i < n; i++ {
+		if err := p.SendAsync(context.Background(), "", "k", "v"); err != nil {
+			t.Fatalf("顺序发送第 %d 条失败: %v", i, err)
+		}
+	}
+
+	var failed int64
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < n/8; i++ {
+				if err := p.SendAsync(context.Background(), "", "k", "v"); err != nil {
+					atomic.AddInt64(&failed, 1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if failed != 0 {
+		t.Fatalf("并发发送失败 %d 条, want 0", failed)
+	}
+
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if handlerCalls != 0 {
+		t.Fatalf("AsyncErrHandler 被调用 %d 次, want 0", handlerCalls)
+	}
+}
+
+// inputAsync 只提供可控的入口通道：无缓冲且无人读取时可模拟 sarama 一直不接收。
+type inputAsync struct {
+	sarama.AsyncProducer
+	in chan *sarama.ProducerMessage
+}
+
+func (a *inputAsync) Input() chan<- *sarama.ProducerMessage { return a.in }
+func (a *inputAsync) AsyncClose()                           {}
+
+// newInputProduction 装配一个使用 inputAsync 的 Production；drained 预先关闭，使 Close 不等待结果。
+func newInputProduction(in chan *sarama.ProducerMessage) *Production {
+	drained := make(chan struct{})
+	close(drained)
+	return &Production{
+		Topic:   "t",
+		async:   &inputAsync{in: in},
+		drained: drained,
+		logger:  &recordingLogger{},
+	}
+}
+
+func TestSendAsync_TimeoutWhileWaiting(t *testing.T) {
+	p := newInputProduction(make(chan *sarama.ProducerMessage))
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := p.SendAsync(ctx, "", "k", "v")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v, want DeadlineExceeded", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("等待 %v 才返回，ctx 超时未生效", d)
+	}
+}
+
+func TestSendAsync_AlreadyCanceled(t *testing.T) {
+	in := make(chan *sarama.ProducerMessage, 1)
+	p := newInputProduction(in)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := p.SendAsync(ctx, "", "k", "v"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want Canceled", err)
+	}
+	if len(in) != 0 {
+		t.Fatalf("ctx 已取消时不应投递消息，入口通道中有 %d 条", len(in))
+	}
+}
+
+func TestSendAsync_NilContext(t *testing.T) {
+	in := make(chan *sarama.ProducerMessage, 1)
+	p := newInputProduction(in)
+
+	// 显式持有 nil context 以测试兼容处理（直接写字面量 nil 会触发 SA1012）。
+	var nilCtx context.Context
+	if err := p.SendAsync(nilCtx, "", "k", "v"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(in) != 1 {
+		t.Fatalf("入口通道中有 %d 条, want 1", len(in))
+	}
+}
+
+// 有发送在等待 sarama 接收时，Close 等它结束（此处为 ctx 超时）后完成，之后发送返回已关闭。
+func TestClose_WaitsBlockedSender(t *testing.T) {
+	p := newInputProduction(make(chan *sarama.ProducerMessage))
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	sendErr := make(chan error, 1)
+	go func() { sendErr <- p.SendAsync(ctx, "", "k", "v") }()
+	time.Sleep(50 * time.Millisecond) // 确保发送已进入等待
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- p.Close() }()
+
+	select {
+	case err := <-sendErr:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("send err=%v, want DeadlineExceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("等待中的发送未在 ctx 超时后返回")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close 未完成")
+	}
+	if err := p.SendAsync(context.Background(), "", "k", "v"); err == nil || !strings.Contains(err.Error(), "closed") {
+		t.Fatalf("关闭后发送 err=%v, want closed", err)
 	}
 }
