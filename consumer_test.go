@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/IBM/sarama"
 	"github.com/IBM/sarama/mocks"
@@ -346,5 +349,164 @@ func TestConsumeClaim_SessionCanceledStopsRetry(t *testing.T) {
 	}
 	if len(marked) != 0 {
 		t.Errorf("len(marked)=%d, want 0", len(marked))
+	}
+}
+
+// fakeGroup 模拟 sarama 消费组：Consume 收到取消后还需 settle 时长收尾
+// （对应 sarama 等待处理协程退出并提交最后位点），再返回。
+type fakeGroup struct {
+	sarama.ConsumerGroup
+	settle     time.Duration
+	mu         sync.Mutex
+	events     []string
+	closeCalls int32
+}
+
+func (g *fakeGroup) record(e string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.events = append(g.events, e)
+}
+
+func (g *fakeGroup) Consume(ctx context.Context, _ []string, _ sarama.ConsumerGroupHandler) error {
+	<-ctx.Done()
+	time.Sleep(g.settle)
+	g.record("consume-done")
+	return nil
+}
+
+func (g *fakeGroup) Close() error {
+	atomic.AddInt32(&g.closeCalls, 1)
+	g.record("group-close")
+	return nil
+}
+
+// newFakeGroupConsumer 装配一个使用 fakeGroup 的 Consumer（相当于 Connect 之后的状态）。
+func newFakeGroupConsumer(g *fakeGroup) *Consumer {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Consumer{
+		Topics:   []string{"t"},
+		CallFunc: func(context.Context, Message) error { return nil },
+		logger:   &recordingLogger{},
+		group:    g,
+		lifeCtx:  ctx,
+		cancel:   cancel,
+	}
+}
+
+// 用过死信（死信 producer 已创建）的消费者被关闭两次时不应崩溃。
+func TestConsumerClose_TwiceWithDLQ(t *testing.T) {
+	mb := sarama.NewMockBroker(t, 1)
+	defer mb.Close()
+	mb.SetHandlerByMap(map[string]sarama.MockResponse{
+		"ApiVersionsRequest": sarama.NewMockApiVersionsResponse(t),
+		"MetadataRequest": sarama.NewMockMetadataResponse(t).
+			SetBroker(mb.Addr(), mb.BrokerID()),
+	})
+	cfg := sarama.NewConfig()
+	cfg.Producer.Return.Successes = true
+	sp, err := sarama.NewSyncProducer([]string{mb.Addr()}, cfg)
+	if err != nil {
+		t.Fatalf("NewSyncProducer: %v", err)
+	}
+	c := &Consumer{dlq: sp}
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond) // 留出时间让二次关闭若触发的后台 panic 暴露出来
+}
+
+// Close 必须等 RunCommit 收尾（处理协程结束、最后位点提交）后才关闭消费组。
+func TestConsumerClose_WaitsRunCommit(t *testing.T) {
+	g := &fakeGroup{settle: 100 * time.Millisecond}
+	c := newFakeGroupConsumer(g)
+	runDone := make(chan error, 1)
+	go func() { runDone <- c.RunCommit() }()
+	time.Sleep(50 * time.Millisecond) // 确保 RunCommit 已进入 Consume
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := <-runDone; err != nil {
+		t.Fatalf("RunCommit: %v", err)
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.events) != 2 || g.events[0] != "consume-done" || g.events[1] != "group-close" {
+		t.Fatalf("events=%v, want [consume-done group-close]", g.events)
+	}
+}
+
+func TestConsumerClose_WithoutRunCommit(t *testing.T) {
+	g := &fakeGroup{}
+	c := newFakeGroupConsumer(g)
+
+	done := make(chan error, 1)
+	go func() { done <- c.Close() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("未运行 RunCommit 时 Close 不应等待")
+	}
+	if g.closeCalls != 1 {
+		t.Fatalf("closeCalls=%d, want 1", g.closeCalls)
+	}
+}
+
+func TestConsumerClose_Concurrent(t *testing.T) {
+	g := &fakeGroup{settle: 50 * time.Millisecond}
+	c := newFakeGroupConsumer(g)
+	runDone := make(chan error, 1)
+	go func() { runDone <- c.RunCommit() }()
+	time.Sleep(20 * time.Millisecond)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := c.Close(); err != nil {
+				t.Errorf("Close: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	<-runDone
+	if n := atomic.LoadInt32(&g.closeCalls); n != 1 {
+		t.Fatalf("closeCalls=%d, want 1", n)
+	}
+}
+
+func TestRunCommit_AfterClose(t *testing.T) {
+	c := newFakeGroupConsumer(&fakeGroup{})
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := c.RunCommit(); err == nil || !strings.Contains(err.Error(), "closed") {
+		t.Fatalf("err=%v, want closed", err)
+	}
+}
+
+func TestRunCommit_AlreadyRunning(t *testing.T) {
+	c := newFakeGroupConsumer(&fakeGroup{})
+	runDone := make(chan error, 1)
+	go func() { runDone <- c.RunCommit() }()
+	time.Sleep(20 * time.Millisecond)
+
+	if err := c.RunCommit(); err == nil || !strings.Contains(err.Error(), "already running") {
+		t.Fatalf("err=%v, want already running", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := <-runDone; err != nil {
+		t.Fatalf("首个 RunCommit 不应受影响, err=%v", err)
 	}
 }

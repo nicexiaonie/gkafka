@@ -54,6 +54,13 @@ type Consumer struct {
 	userCtx context.Context
 	lifeCtx context.Context
 	cancel  context.CancelFunc
+
+	// stateMu 保护 closed 与 runDone，使 Close 与 RunCommit 的登记互斥：
+	// 要么 RunCommit 先登记、Close 必等它退出，要么 Close 先标记、RunCommit 直接返回。
+	stateMu sync.Mutex
+	closed  bool
+	// runDone 非 nil 表示 RunCommit 正在运行，其退出时关闭该通道。
+	runDone chan struct{}
 }
 
 // Connect 建立消费组连接并初始化配置。注册时自动调用。缺少 GroupId/Topics 时返回 error。
@@ -146,6 +153,7 @@ func (c *Consumer) validateRetryPolicy() error {
 
 // RunCommit 启动自动消费循环（推模式），阻塞运行直到 Close。
 // 业务函数返回 nil 提交 offset；返回 error 按 MaxRetry/OnExceed 处理。
+// 同一消费者同时只能运行一个 RunCommit；Close 之后调用返回错误。
 func (c *Consumer) RunCommit() error {
 	if c.CallFunc == nil {
 		return errors.New("gkafka: CallFunc is required")
@@ -153,6 +161,25 @@ func (c *Consumer) RunCommit() error {
 	if c.group == nil {
 		return errors.New("gkafka: consumer is not connected")
 	}
+	c.stateMu.Lock()
+	if c.closed {
+		c.stateMu.Unlock()
+		return errors.New("gkafka: consumer is closed")
+	}
+	if c.runDone != nil {
+		c.stateMu.Unlock()
+		return errors.New("gkafka: RunCommit is already running")
+	}
+	done := make(chan struct{})
+	c.runDone = done
+	c.stateMu.Unlock()
+	// 退出即表示 sarama Consume 已返回：处理协程全部结束、最后位点已尝试提交。Close 据此等待。
+	defer func() {
+		c.stateMu.Lock()
+		c.runDone = nil
+		c.stateMu.Unlock()
+		close(done)
+	}()
 
 	h := &groupHandler{c: c}
 	for {
@@ -313,9 +340,24 @@ func (c *Consumer) toDLQMessage(msg *sarama.ConsumerMessage, attempt int, cause 
 }
 
 // Close 取消消费循环并关闭消费组与死信生产者。返回过程中出现的最后一个错误。
+// 可重复、并发调用，仅首次执行关闭。若 RunCommit 正在运行，先等它退出（处理中的消息结束、
+// 最后位点提交）再关闭消费组与死信生产者——因此 CallFunc 长耗时处理应监听 ctx.Done()，
+// 且不可在 CallFunc 内同步调用 Close（会互相等待而卡死）。
 func (c *Consumer) Close() error {
+	c.stateMu.Lock()
+	if c.closed {
+		c.stateMu.Unlock()
+		return nil
+	}
+	c.closed = true
+	runDone := c.runDone
+	c.stateMu.Unlock()
+
 	if c.cancel != nil {
 		c.cancel()
+	}
+	if runDone != nil {
+		<-runDone
 	}
 	var e error
 	if c.group != nil {

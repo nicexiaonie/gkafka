@@ -164,8 +164,12 @@ c.RunCommit() // 阻塞运行，自动消费 + 自动提交
 
 | 方法 | 说明 |
 |---|---|
-| `RunCommit()` | 阻塞运行的自动消费循环（推模式） |
-| `Close()` | 停止消费并关闭连接 |
+| `RunCommit()` | 阻塞运行的自动消费循环（推模式）；同一消费者同时只能运行一个，`Close()` 之后调用返回错误 |
+| `Close()` | 停止消费并关闭连接；会等处理中的消息结束、最后位点提交后再关闭；可重复调用，仅首次生效 |
+
+> **`Close()` 会等处理中的消息结束**：关闭时先发出取消信号，等 `RunCommit` 完全退出（所有分区的 `CallFunc` 返回、最后一批位点提交）后，再离开消费组、关闭连接与死信 producer，避免最后一批已处理消息的位点提交失败导致重启后重复消费。因此：
+> - `CallFunc` 中的长耗时处理应监听 `ctx.Done()` 及时返回，否则 `Close()` 会一直等待。
+> - **不要在 `CallFunc` 内同步调用 `Close()`**：`Close()` 等 `CallFunc` 返回、`CallFunc` 等 `Close()` 返回，会互相等待而卡死。需要在处理中触发关闭时，请另起协程调用。
 
 ## 投递语义与失败处理（重要）
 
@@ -209,7 +213,7 @@ c.RunCommit() // 阻塞运行，自动消费 + 自动提交
 
 `CallFunc` 的首个参数 `ctx context.Context`：
 - **取值**：来自 `ConsumerConf.Ctx`（你注册时传入，可携带 traceID 等 request 级值）。
-- **取消**：在 `Close()` 或 rebalance 时被取消。长耗时处理可监听 `ctx.Done()` 提前退出，避免在分区即将被收走时空跑。
+- **取消**：在 `Close()` 或 rebalance 时被取消。长耗时处理应监听 `ctx.Done()` 提前退出，避免在分区即将被收走时空跑，也避免拖住 `Close()`（它会等 `CallFunc` 返回）。
 
 ```go
 CallFunc: func(ctx context.Context, m gkafka.Message) error {
