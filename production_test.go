@@ -335,7 +335,7 @@ func TestClose_DrainsInflightResults(t *testing.T) {
 
 // newMockBrokerProduction 用 sarama 模拟 broker 驱动真实的 sarama producer，
 // 与 mocks.AsyncProducer 不同，其异步入口通道与生产环境一样是无缓冲的。
-func newMockBrokerProduction(t *testing.T, onErr func(Message, error)) *Production {
+func newMockBrokerProduction(t *testing.T, onErr func(Message, error), opts ...func(*Production)) *Production {
 	t.Helper()
 	mb := sarama.NewMockBroker(t, 1)
 	t.Cleanup(mb.Close)
@@ -347,6 +347,9 @@ func newMockBrokerProduction(t *testing.T, onErr func(Message, error)) *Producti
 		"ProduceRequest": sarama.NewMockProduceResponse(t),
 	})
 	p := &Production{Brokers: []string{mb.Addr()}, Topic: "t", logger: &recordingLogger{}, AsyncErrHandler: onErr}
+	for _, opt := range opts {
+		opt(p)
+	}
 	if err := p.Connect(); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -487,4 +490,55 @@ func TestClose_WaitsBlockedSender(t *testing.T) {
 	if err := p.SendAsync(context.Background(), "", "k", "v"); err == nil || !strings.Contains(err.Error(), "closed") {
 		t.Fatalf("关闭后发送 err=%v, want closed", err)
 	}
+}
+
+// sendWithin 在 limit 内等待一次同步 Send 返回，返回耗时；超时则判定失败。
+func sendWithin(t *testing.T, p *Production, limit time.Duration) time.Duration {
+	t.Helper()
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() { done <- p.Send(context.Background(), "k", "v") }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+		return time.Since(start)
+	case <-time.After(limit):
+		t.Fatalf("Send 超过 %v 未返回", limit)
+		return 0
+	}
+}
+
+// 只设 BatchSize 未设 BatchTimeout 时，未攒满的批次也应在默认 1s 内发出，而不是一直卡住。
+func TestSend_BatchSizeWithoutTimeoutFlushes(t *testing.T) {
+	p := newMockBrokerProduction(t, nil, func(p *Production) { p.BatchSize = 100 })
+	d := sendWithin(t, p, 3*time.Second)
+	if d < 500*time.Millisecond {
+		t.Errorf("耗时 %v，未攒满时应等待默认 BatchTimeout（1s）后才发出", d)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// 显式设置的 BatchTimeout 不被默认值覆盖。
+func TestSend_ExplicitBatchTimeoutKept(t *testing.T) {
+	p := newMockBrokerProduction(t, nil, func(p *Production) {
+		p.BatchSize = 100
+		p.BatchTimeout = 50 * time.Millisecond
+	})
+	if d := sendWithin(t, p, 3*time.Second); d > 500*time.Millisecond {
+		t.Errorf("耗时 %v，显式 BatchTimeout=50ms 未生效", d)
+	}
+	_ = p.Close()
+}
+
+// BatchSize=1 每条即攒满，默认 BatchTimeout 不应引入额外延迟。
+func TestSend_BatchSizeOneNoExtraDelay(t *testing.T) {
+	p := newMockBrokerProduction(t, nil, func(p *Production) { p.BatchSize = 1 })
+	if d := sendWithin(t, p, 3*time.Second); d > 500*time.Millisecond {
+		t.Errorf("耗时 %v，BatchSize=1 不应等待 BatchTimeout", d)
+	}
+	_ = p.Close()
 }

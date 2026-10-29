@@ -223,12 +223,13 @@ type ProductionConf struct {
 	// 因此与 Acks=AcksLocal/AcksNone 冲突——若同时显式指定非 AcksAll 的 Acks 将在注册时报错。
 	Idempotent bool
 
-	// BatchSize 一批攒够多少条消息就触发发送。0 = 用 sarama 默认。
+	// BatchSize 一批攒够多少条消息就触发发送。0 = 不按条数攒批。
 	// 注意：低流量下若设得过大，消息会等到 BatchTimeout 才发出，增加单条延迟。
 	BatchSize int
-	// BatchBytes 一批累计到多少字节就触发发送。0 = 用 sarama 默认。
+	// BatchBytes 一批累计到多少字节就触发发送。0 = 不按字节攒批。
 	BatchBytes int
-	// BatchTimeout 距上次发送超过该时长则强制把未满的批次发出。0 = 用 sarama 默认（约 1s）。
+	// BatchTimeout 距上次发送超过该时长则强制把未满的批次发出。
+	// 0 时：若设置了 BatchSize 或 BatchBytes，默认 1s；三者都为 0 则不攒批，有消息即尽快发送。
 	BatchTimeout time.Duration
 	// WriteTimeout 单次网络写操作的超时时间。0 = 用 sarama 默认。
 	WriteTimeout time.Duration

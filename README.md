@@ -162,7 +162,7 @@ type Header struct {
 | `Balancer` | Balancer | 分区策略，见[分区策略](#分区策略) | `BalancerRandom` |
 | `Acks` | Acks | 确认级别，见[确认级别与幂等写入](#确认级别与幂等写入) | `AcksLocal` |
 | `Idempotent` | bool | 幂等写入 | `false` |
-| `BatchSize` / `BatchBytes` / `BatchTimeout` | int / int / Duration | 攒批参数，见[攒批](#攒批) | 不攒批 |
+| `BatchSize` / `BatchBytes` / `BatchTimeout` | int / int / Duration | 攒批参数，见[攒批](#攒批) | 不攒批；只设条数或字节时 `BatchTimeout` 默认 1s |
 | `WriteTimeout` | Duration | 单次网络写超时 | 30s |
 | `AsyncErrHandler` | func(Message, error) | 异步发送的 broker 侧失败回调，见[异步发送](#异步发送) | 写日志 |
 | `SASL` / `TLS` | SASLConf / TLSConf | 认证与加密，见[认证与加密](#认证与加密) | 关闭 |
@@ -255,15 +255,15 @@ gkafka.RegisterProduction("orders", &gkafka.ProductionConf{
 
 ### 攒批
 
-默认不攒批：有消息就尽快发送，延迟最低。高吞吐场景可攒批以减少请求数：
+默认不攒批：有消息就尽快发送，延迟最低。高吞吐场景可攒批以减少请求数，满足任一条件即发送：
 
 | 字段 | 触发条件 |
 |---|---|
 | `BatchSize` | 攒够多少条 |
 | `BatchBytes` | 攒够多少字节 |
-| `BatchTimeout` | 距上次发送超过该时长 |
+| `BatchTimeout` | 距上次发送超过该时长；设置了 `BatchSize` 或 `BatchBytes` 而未设置它时，默认 **1s** |
 
-> ⚠️ **设置 `BatchSize` 或 `BatchBytes` 时必须同时设置 `BatchTimeout`**。否则只有攒够数量才发送，低流量时消息会一直停在缓冲里：同步 `Send` 会一直卡住，异步消息迟迟不到 broker。
+> 低流量时攒不满一批，消息要等到 `BatchTimeout` 才发出，同步 `Send` 也随之等待。对延迟敏感时请显式设置较小的 `BatchTimeout`。
 
 ```go
 BatchSize:    500,

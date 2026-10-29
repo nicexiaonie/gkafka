@@ -46,6 +46,9 @@ type Production struct {
 	closed bool
 }
 
+// defaultBatchTimeout 是设置了 BatchSize/BatchBytes 但未设置 BatchTimeout 时的默认攒批超时。
+const defaultBatchTimeout = time.Second
+
 // Connect 建立底层连接（一个 sarama.Client），并在其之上派生同步与异步 producer。
 // 两者共享该连接与配置。注册时自动调用。
 func (p *Production) Connect() error {
@@ -90,6 +93,10 @@ func (p *Production) Connect() error {
 	}
 	if p.BatchTimeout > 0 {
 		cfg.Producer.Flush.Frequency = p.BatchTimeout
+	} else if p.BatchSize > 0 || p.BatchBytes > 0 {
+		// sarama 在设置了条数/字节触发但无时间触发时，只在攒满后才发送：低流量下消息停在缓冲里，
+		// 同步 Send 一直等待并持有读锁，进而使 Close 拿不到写锁而卡死。补默认时间触发兜底。
+		cfg.Producer.Flush.Frequency = defaultBatchTimeout
 	}
 	if p.WriteTimeout > 0 {
 		cfg.Net.WriteTimeout = p.WriteTimeout
