@@ -2,9 +2,14 @@ package gkafka
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/IBM/sarama"
+	"github.com/IBM/sarama/mocks"
 )
 
 func TestFromProducerMessage(t *testing.T) {
@@ -145,4 +150,115 @@ func TestClose_Idempotent(t *testing.T) {
 	if err := p.Close(); err != nil {
 		t.Fatalf("unexpected error on second close: %v", err)
 	}
+}
+
+// chanLogger 把每条日志格式化后写入 channel，供断言默认日志路径。
+type chanLogger chan string
+
+func (l chanLogger) Printf(format string, v ...interface{}) { l <- fmt.Sprintf(format, v...) }
+
+func TestSend_Success(t *testing.T) {
+	sp := mocks.NewSyncProducer(t, nil)
+	sp.ExpectSendMessageWithMessageCheckerFunctionAndSucceed(func(msg *sarama.ProducerMessage) error {
+		k, _ := msg.Key.Encode()
+		v, _ := msg.Value.Encode()
+		if msg.Topic != "t" || string(k) != "k" || string(v) != "v" {
+			return fmt.Errorf("消息内容错误: topic=%s key=%s value=%s", msg.Topic, k, v)
+		}
+		return nil
+	})
+	p := &Production{Topic: "t", sync: sp, logger: &recordingLogger{}}
+
+	if err := p.Send(context.Background(), "k", "v"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	_ = sp.Close()
+}
+
+func TestSend_FailureReturnsError(t *testing.T) {
+	errBoom := errors.New("boom")
+	sp := mocks.NewSyncProducer(t, nil)
+	sp.ExpectSendMessageAndFail(errBoom)
+	p := &Production{Topic: "t", sync: sp, logger: &recordingLogger{}}
+
+	if err := p.Send(context.Background(), "k", "v"); !errors.Is(err, errBoom) {
+		t.Fatalf("err=%v, want %v", err, errBoom)
+	}
+	_ = sp.Close()
+}
+
+func TestSendPartition_SetsPartition(t *testing.T) {
+	cfg := mocks.NewTestConfig()
+	cfg.Producer.Partitioner = sarama.NewManualPartitioner
+	sp := mocks.NewSyncProducer(t, cfg)
+	sp.ExpectSendMessageWithMessageCheckerFunctionAndSucceed(func(msg *sarama.ProducerMessage) error {
+		if msg.Partition != 3 {
+			return fmt.Errorf("Partition=%d, want 3", msg.Partition)
+		}
+		return nil
+	})
+	p := &Production{Topic: "t", Balancer: BalancerManual, sync: sp, logger: &recordingLogger{}}
+
+	if err := p.SendPartition(context.Background(), 3, "k", "v"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	_ = sp.Close()
+}
+
+// 异步测试结束时直接关闭 mock，不走 Production.Close。
+func TestSendAsync_ErrorGoesToHandler(t *testing.T) {
+	errBoom := errors.New("boom")
+	ap := mocks.NewAsyncProducer(t, nil)
+	ap.ExpectInputAndFail(errBoom)
+	type result struct {
+		msg Message
+		err error
+	}
+	got := make(chan result, 1)
+	p := &Production{
+		Topic:  "t",
+		async:  ap,
+		logger: &recordingLogger{},
+		AsyncErrHandler: func(msg Message, err error) {
+			got <- result{msg, err}
+		},
+	}
+	go p.drainAsync()
+
+	if err := p.SendAsync(context.Background(), "", "k", "v"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	select {
+	case r := <-got:
+		if !errors.Is(r.err, errBoom) {
+			t.Errorf("err=%v, want %v", r.err, errBoom)
+		}
+		if r.msg.Topic != "t" || string(r.msg.Key) != "k" || string(r.msg.Value) != "v" {
+			t.Errorf("回调消息错误: %+v", r.msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("AsyncErrHandler 未被调用")
+	}
+	_ = ap.Close()
+}
+
+func TestSendAsync_ErrorDefaultsToLogger(t *testing.T) {
+	ap := mocks.NewAsyncProducer(t, nil)
+	ap.ExpectInputAndFail(errors.New("boom"))
+	logs := make(chanLogger, 1)
+	p := &Production{Topic: "t", async: ap, logger: logs}
+	go p.drainAsync()
+
+	if err := p.SendAsync(context.Background(), "", "k", "v"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	select {
+	case line := <-logs:
+		if !strings.Contains(line, "gkafka async send error") || !strings.Contains(line, "boom") {
+			t.Errorf("日志内容错误: %s", line)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("未设置 AsyncErrHandler 时应写日志")
+	}
+	_ = ap.Close()
 }

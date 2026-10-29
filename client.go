@@ -363,7 +363,8 @@ func RegisterProduction(name string, pc *ProductionConf) error {
 	}
 	kafkaProduction[name] = p
 	mu.Unlock()
-	p.logger.Printf("gkafka RegisterProduction: name=%s addr=%s topic=%s", name, p.Address, p.Topic)
+	brokers, _ := resolveBrokers(p.Brokers, p.Address)
+	p.logger.Printf("gkafka RegisterProduction: name=%s brokers=%v topic=%s", name, brokers, p.Topic)
 	return nil
 }
 

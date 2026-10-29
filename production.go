@@ -121,7 +121,7 @@ func (p *Production) Connect() error {
 	p.closed = false
 	go p.drainAsync()
 
-	p.logger.Printf("gkafka Connect production: addr=%s topic=%s", p.Address, p.Topic)
+	p.logger.Printf("gkafka Connect production: brokers=%v topic=%s", brokers, p.Topic)
 	return nil
 }
 

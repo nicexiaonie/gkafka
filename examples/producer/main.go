@@ -7,17 +7,10 @@ import (
 )
 
 func main() {
-
-	/*
-	   network: tcp
-	   address: 10.20.0.200:9092
-	   group_id: flow_sync
-
-	*/
 	err := gkafka.RegisterProduction("demo", &gkafka.ProductionConf{
-		Brokers: []string{"10.20.0.200:9092"},
+		Brokers: []string{"localhost:9092"},
 		// 如果不配置topic
-		Topic:     "data_sync_canal_to_clickhouse_mjdb_mlchangch_end_rec",
+		Topic:     "demo_topic",
 		BatchSize: 1,
 		// 分区策略（推荐用 Balancer* 常量，也可写等价字符串）：
 		//   BalancerHash / BalancerReferenceHash / BalancerRoundRobin / BalancerRandom / BalancerManual
@@ -38,7 +31,7 @@ func main() {
 	//production.SendPartition(ctx, 2, "1111", "11111")
 
 	// 可以指定topic发送
-	production.SendTopic(ctx, "data_sync_canal_to_clickhouse", "test", "test")
+	production.SendTopic(ctx, "demo_topic_other", "test", "test")
 
 	_ = production.Close()
 }
