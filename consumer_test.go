@@ -281,7 +281,6 @@ func TestConsumeClaim_DLQAfterMaxRetry(t *testing.T) {
 		},
 		dlq: sp,
 	}
-	c.dlqOnce.Do(func() {}) // 跳过懒加载，直接使用注入的 mock
 
 	marked := runClaim(t, context.Background(), c, &sarama.ConsumerMessage{Topic: "t"})
 
@@ -316,7 +315,6 @@ func TestConsumeClaim_DLQFailureKeepsRetrying(t *testing.T) {
 		},
 		dlq: sp,
 	}
-	c.dlqOnce.Do(func() {})
 
 	marked := runClaim(t, ctx, c, &sarama.ConsumerMessage{Topic: "t"})
 
@@ -508,5 +506,64 @@ func TestRunCommit_AlreadyRunning(t *testing.T) {
 	}
 	if err := <-runDone; err != nil {
 		t.Fatalf("首个 RunCommit 不应受影响, err=%v", err)
+	}
+}
+
+// newDLQMockBroker 启动一个只应答连接握手与元数据的模拟 broker，足以创建消费组 client 与死信 producer。
+func newDLQMockBroker(t *testing.T) *sarama.MockBroker {
+	t.Helper()
+	mb := sarama.NewMockBroker(t, 1)
+	t.Cleanup(mb.Close)
+	mb.SetHandlerByMap(map[string]sarama.MockResponse{
+		"ApiVersionsRequest": sarama.NewMockApiVersionsResponse(t),
+		"MetadataRequest": sarama.NewMockMetadataResponse(t).
+			SetBroker(mb.Addr(), mb.BrokerID()),
+	})
+	return mb
+}
+
+// 配置死信时，Connect 阶段即创建死信 producer。
+func TestConsumerConnect_CreatesDLQProducer(t *testing.T) {
+	mb := newDLQMockBroker(t)
+	c := &Consumer{
+		Brokers:  []string{mb.Addr()},
+		Topics:   []string{"t"},
+		GroupId:  "g",
+		MaxRetry: 1,
+		OnExceed: OnExceedDLQ,
+		DLQTopic: "dlq",
+		logger:   &recordingLogger{},
+	}
+	if err := c.Connect(); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer c.Close()
+	if c.dlq == nil {
+		t.Fatal("配置死信时 Connect 后 dlq 应已创建")
+	}
+}
+
+// 未配置死信时不创建死信 producer。
+func TestConsumerConnect_NoDLQProducerWithoutDLQ(t *testing.T) {
+	mb := newDLQMockBroker(t)
+	for _, oe := range []struct {
+		maxRetry int
+		onExceed OnExceed
+	}{{0, ""}, {1, OnExceedSkip}} {
+		c := &Consumer{
+			Brokers:  []string{mb.Addr()},
+			Topics:   []string{"t"},
+			GroupId:  "g",
+			MaxRetry: oe.maxRetry,
+			OnExceed: oe.onExceed,
+			logger:   &recordingLogger{},
+		}
+		if err := c.Connect(); err != nil {
+			t.Fatalf("Connect(%+v): %v", oe, err)
+		}
+		if c.dlq != nil {
+			t.Errorf("OnExceed=%q 时不应创建 dlq", oe.onExceed)
+		}
+		_ = c.Close()
 	}
 }

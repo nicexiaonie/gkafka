@@ -194,7 +194,7 @@ c.RunCommit() // 阻塞运行，自动消费 + 自动提交
 
 重试退避：前 3 次立即重试，超过 3 次每次间隔 1s，超过 100 次每次间隔 5s。
 
-> **死信队列**：把处理不动的消息投递到另一个 topic 后提交 offset，主流程继续。死信消息会保留原始 Key/Value/Headers，并追加 `gkafka-dlq-source-topic`、`gkafka-dlq-source-partition`、`gkafka-dlq-source-offset`、`gkafka-dlq-attempt`、`gkafka-dlq-error` headers 方便排查。既不丢也不卡，但死信 topic 里的消息需自行写程序消费或人工处理，否则只是换个地方堆积。死信投递本身失败时不提交、继续重试，避免丢消息。
+> **死信队列**：把处理不动的消息投递到另一个 topic 后提交 offset，主流程继续。死信消息会保留原始 Key/Value/Headers，并追加 `gkafka-dlq-source-topic`、`gkafka-dlq-source-partition`、`gkafka-dlq-source-offset`、`gkafka-dlq-attempt`、`gkafka-dlq-error` headers 方便排查。既不丢也不卡，但死信 topic 里的消息需自行写程序消费或人工处理，否则只是换个地方堆积。死信投递本身失败时不提交、继续重试，避免丢消息。配置 `OnExceed=OnExceedDLQ` 时，死信 producer 在注册（`RegisterConsumer`）阶段即创建，创建失败则注册返回错误——死信相关的连接、认证、权限问题在启动时暴露，而不是等到第一条消息失败才发现；代价是即使从未用到死信也会多占一个到 broker 的连接。
 
 ### 消费起点 `InitialOffset`
 

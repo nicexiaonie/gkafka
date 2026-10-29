@@ -9,6 +9,7 @@ package gkafka
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"sync"
 	"time"
@@ -45,10 +46,8 @@ type Consumer struct {
 
 	group sarama.ConsumerGroup
 
-	// dlq 死信生产者，按需懒加载。
-	dlq     sarama.SyncProducer
-	dlqOnce sync.Once
-	dlqErr  error
+	// dlq 死信生产者，OnExceed=dlq 时在 Connect 中创建；创建后的断线重连由 sarama 负责。
+	dlq sarama.SyncProducer
 
 	// userCtx 是使用者传入的业务上下文（仅传值）；lifeCtx 是内部生命周期上下文（Close 时取消）。
 	userCtx context.Context
@@ -109,6 +108,15 @@ func (c *Consumer) Connect() error {
 	group, err := sarama.NewConsumerGroup(brokers, c.GroupId, cfg)
 	if err != nil {
 		return err
+	}
+	// 配置了死信时在注册阶段创建死信 producer：配置错误启动即暴露，运行中不存在"创建失败"。
+	if c.OnExceed == OnExceedDLQ {
+		dlq, err := newDLQProducer(brokers, c.SASL, c.TLS)
+		if err != nil {
+			_ = group.Close()
+			return fmt.Errorf("gkafka: create DLQ producer: %w", err)
+		}
+		c.dlq = dlq
 	}
 	c.group = group
 
@@ -286,27 +294,20 @@ func (c *Consumer) toDLQ(msg *sarama.ConsumerMessage, attempt int, cause error) 
 	if len(c.DLQTopic) == 0 {
 		return errors.New("gkafka: OnExceed=dlq requires DLQTopic")
 	}
-	c.dlqOnce.Do(func() {
-		pcfg, err := buildConfig(c.SASL, c.TLS)
-		if err != nil {
-			c.dlqErr = err
-			return
-		}
-		pcfg.Producer.Return.Successes = true
-		pcfg.Producer.Return.Errors = true
-		pcfg.Producer.RequiredAcks = sarama.WaitForLocal
-		brokers, err := resolveBrokers(c.Brokers, c.Address)
-		if err != nil {
-			c.dlqErr = err
-			return
-		}
-		c.dlq, c.dlqErr = sarama.NewSyncProducer(brokers, pcfg)
-	})
-	if c.dlqErr != nil {
-		return c.dlqErr
-	}
 	_, _, err := c.dlq.SendMessage(c.toDLQMessage(msg, attempt, cause))
 	return err
+}
+
+// newDLQProducer 创建死信同步 producer，复用消费端的认证与加密配置。
+func newDLQProducer(brokers []string, sc SASLConf, tc TLSConf) (sarama.SyncProducer, error) {
+	pcfg, err := buildConfig(sc, tc)
+	if err != nil {
+		return nil, err
+	}
+	pcfg.Producer.Return.Successes = true
+	pcfg.Producer.Return.Errors = true
+	pcfg.Producer.RequiredAcks = sarama.WaitForLocal
+	return sarama.NewSyncProducer(brokers, pcfg)
 }
 
 // toDLQMessage 将消费失败的消息转换为发往 DLQTopic 的 ProducerMessage。
